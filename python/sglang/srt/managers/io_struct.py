@@ -2289,6 +2289,9 @@ class AbortReq(BaseReq, kw_only=True):
     finished_reason: Optional[FinishReasonDict] = None
     abort_message: Optional[str] = None
     weight_versions: Optional[WeightVersionSpans] = None
+    # Joint checkpoint (--enable-joint-checkpoint): release the request's KV
+    # without inserting it into the radix tree.
+    discard: bool = False
 
     def __post_init__(self):
         # FIXME: This is a hack to keep the same with the old code
@@ -2424,6 +2427,30 @@ class ConfigureLoggingReq(BaseReq, kw_only=True):
     dump_requests_threshold: Optional[int] = None
     crash_dump_folder: Optional[str] = None
     dump_requests_exclude_meta_keys: Optional[List[str]] = None
+
+
+class PinReqInput(BaseReq, kw_only=True):
+    """Joint checkpoint: hold the running request ``rid``'s KV prefix
+    ``[0, up_to)`` in the radix tree until ``UnpinReqInput`` for the same rid.
+    The hold is independent of the request's lifetime."""
+
+    up_to: int
+
+
+class PinReqOutput(BaseReq, kw_only=True):
+    success: bool
+    # Tokens actually held (``up_to`` clamped to the request's KV and page-aligned).
+    pinned_len: int = 0
+    message: str = ""
+
+
+class UnpinReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class UnpinReqOutput(BaseReq, kw_only=True):
+    success: bool
+    message: str = ""
 
 
 class OpenSessionReqInput(BaseReq, kw_only=True):

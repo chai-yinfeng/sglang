@@ -58,6 +58,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
+    PinReqInput,
+    PinReqOutput,
     ProfileReq,
     ProfileReqOutput,
     ProfileReqType,
@@ -76,6 +78,8 @@ from sglang.srt.managers.io_struct import (
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnpinReqInput,
+    UnpinReqOutput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromDistributedReqOutput,
     UpdateWeightsFromIPCReqInput,
@@ -144,6 +148,8 @@ _COMMUNICATOR_SPECS = [
     ("update_lora_adapter", LoRAUpdateOutput),
     ("dumper_control", DumperControlReqOutput),
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
+    ("pin_request", PinReqOutput),
+    ("unpin_request", UnpinReqOutput),
 ]
 
 
@@ -916,6 +922,17 @@ class TokenizerControlMixin:
     ):
         self.auto_create_handle_loop()
         await self.slow_down_communicator(obj)
+
+    async def pin_request(self: TokenizerManager, obj: PinReqInput) -> PinReqOutput:
+        """Joint checkpoint: hold a running request's KV prefix in the tree."""
+        self.auto_create_handle_loop()
+        return (await self.pin_request_communicator(obj))[0]
+
+    async def unpin_request(
+        self: TokenizerManager, obj: UnpinReqInput
+    ) -> UnpinReqOutput:
+        self.auto_create_handle_loop()
+        return (await self.unpin_request_communicator(obj))[0]
 
     async def pd_role_switch(
         self: TokenizerManager,

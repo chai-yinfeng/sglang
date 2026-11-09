@@ -150,6 +150,7 @@ from sglang.srt.managers.io_struct import (
     ParseFunctionCallReq,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PinReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
@@ -158,6 +159,7 @@ from sglang.srt.managers.io_struct import (
     SetInternalStateReq,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
+    UnpinReqInput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -1724,11 +1726,30 @@ async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
     """Abort a request."""
     try:
         _global_state.tokenizer_manager.abort_request(
-            rid=obj.rid, abort_all=obj.abort_all
+            rid=obj.rid, abort_all=obj.abort_all, discard=obj.discard
         )
         return Response(status_code=200)
     except Exception as e:
         return _create_error_response(e)
+
+
+@app.post("/pin_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pin_request(obj: Annotated[PinReqInput, Body()], request: Request):
+    """Joint checkpoint: hold a running request's KV prefix [0, up_to) in the
+    radix tree until /unpin_request (needs --enable-joint-checkpoint)."""
+    result = await _global_state.tokenizer_manager.pin_request(obj)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.post("/unpin_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def unpin_request(obj: Annotated[UnpinReqInput, Body()], request: Request):
+    """Joint checkpoint: release the hold taken by /pin_request for this rid."""
+    result = await _global_state.tokenizer_manager.unpin_request(obj)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 
 
 @app.post("/parse_function_call")

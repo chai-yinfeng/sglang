@@ -91,6 +91,10 @@ class Memory(msgspec.Struct):
         Optional[str],
         "Name of a radix-cache backend previously registered via register_radix_cache_backend. Omit this flag to use the built-in default cache selection chain.",
     ] = None
+    enable_joint_checkpoint: A[
+        bool,
+        "Enable the joint-checkpoint control primitives on the radix cache: /pin_request and /unpin_request hold a running request's KV prefix in the tree independent of the request's lifetime, and /abort_request accepts discard=true to release a request's KV without inserting it into the tree.",
+    ] = False
 
     # -------------------------------------------------------------------------
     # Hierarchical cache

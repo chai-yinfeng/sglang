@@ -2238,7 +2238,9 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 return_exceptions=True,
             )
 
-    def abort_request(self, rid: str = "", abort_all: bool = False):
+    def abort_request(
+        self, rid: str = "", abort_all: bool = False, discard: bool = False
+    ):
         # Empty rid would startswith-match every request on the scheduler.
         if not abort_all and not rid:
             logger.warning("Ignore abort_request with empty rid and abort_all=False")
@@ -2251,7 +2253,7 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 state.abort_sent = True
             elif get_serving().tokenizer_worker_num == 1:
                 return
-        req = AbortReq(rid=rid, abort_all=abort_all)
+        req = AbortReq(rid=rid, abort_all=abort_all, discard=discard)
         try:
             self._dispatch_to_scheduler(req)
         except BaseException:

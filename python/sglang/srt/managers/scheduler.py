@@ -165,6 +165,8 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     PauseGenerationReqInput,
     PdRoleSwitchReqInput,
+    PinReqInput,
+    PinReqOutput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     RemoveExternalCorpusReqInput,
@@ -184,6 +186,8 @@ from sglang.srt.managers.io_struct import (
     TokenizedGenerateReqInput,
     UnloadLoRAAdapterReqInput,
     UnloadLoRAAdapterReqOutput,
+    UnpinReqInput,
+    UnpinReqOutput,
     UpdateWeightFromDiskReqInput,
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
@@ -295,7 +299,7 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome
+from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome, TreeLock
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
@@ -513,6 +517,10 @@ class Scheduler(
         self.enable_hierarchical_cache = get_memory().enable_hierarchical_cache
         self.enable_lmcache = get_memory().enable_lmcache
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
+        self.enable_joint_checkpoint = get_memory().enable_joint_checkpoint
+        # Joint checkpoint: rid -> extra tree lock taken by /pin_request. The
+        # lock outlives the request; /unpin_request or flush_cache releases it.
+        self.pin_table: Dict[str, TreeLock] = {}
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -1838,6 +1846,8 @@ class Scheduler(
                 (AbortReq, self.abort_request),
                 (OpenSessionReqInput, self.open_session),
                 (CloseSessionReqInput, self.close_session),
+                (PinReqInput, self.pin_request),
+                (UnpinReqInput, self.unpin_request),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -5520,6 +5530,8 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
+            # Pinned nodes do not survive the reset; drop their locks with them.
+            self.pin_table.clear()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5803,6 +5815,10 @@ class Scheduler(
                 # The request will still run one decode forward pass.
                 # Then we reuse all existing code to clean up the KV cache allocation.
                 logger.debug(f"Abort running request. {req.rid=}")
+                if recv_req.discard and self.enable_joint_checkpoint:
+                    # Joint checkpoint discard: release_kv_cache(checkpoint=True)
+                    # on finish skips the tree insert for this request.
+                    req.skip_radix_cache_insert = True
                 if recv_req.abort_message:
                     # Timeout aborts carry an SLA message + 503 for the client.
                     req.to_finish = FINISH_ABORT(
@@ -6156,6 +6172,78 @@ class Scheduler(
             or not self.enable_session_radix_cache
         ):
             self.session_controller.close(recv_req)
+
+    def _find_inflight_req(self, rid: str) -> Optional[Req]:
+        """Exact-rid lookup among requests that hold KV (running or chunked)."""
+        if (req := self.chunked_req) is not None and req.rid == rid:
+            return req
+        for req in self.collect_inflight_reqs():
+            if req.rid == rid:
+                return req
+        return None
+
+    def pin_request(self, recv_req: PinReqInput):
+        """Joint checkpoint P1: insert the running request's KV prefix
+        [0, up_to) into the tree and hold it with a lock the request does not
+        own, so it stays resident after the request finishes or is aborted."""
+        if not self.enable_joint_checkpoint:
+            return PinReqOutput(
+                success=False, message="--enable-joint-checkpoint is not set"
+            )
+        rid = recv_req.rid
+        req = self._find_inflight_req(rid)
+        if req is None or req.finished() or not req.kv.holds_kv:
+            return PinReqOutput(success=False, message=f"request {rid} is not running")
+        if req.session is not None and req.session.streaming:
+            # A streaming-session turn's tree lock belongs to the session slot.
+            return PinReqOutput(
+                success=False, message="cannot pin a streaming-session request"
+            )
+        if req.skip_radix_cache_insert:
+            return PinReqOutput(
+                success=False, message="request is barred from the radix tree"
+            )
+        # Same clamp as release_kv_cache: only KV the request owns can be keyed.
+        req.refresh_fill_ids()
+        up_to = min(
+            recv_req.up_to, req.owned_kv_len(), len(req.full_untruncated_fill_ids)
+        )
+        if up_to > req.kv.cache_protected_len:
+            # checkpoint page-aligns the insert and moves req.lock / req.last_node
+            # to the node it ended on.
+            self.tree_cache.checkpoint(req, up_to=up_to)
+        # [0, cache_protected_len) is already in the tree, ending at last_node;
+        # a shorter up_to is covered by holding that node.
+        pinned_len = req.kv.cache_protected_len
+        new_lock = self.tree_cache.lock(req.last_node)
+        if new_lock is None:
+            return PinReqOutput(
+                success=False, pinned_len=0, message="tree did not hand out a lock"
+            )
+        # Re-pinning the same rid replaces the earlier hold.
+        old_lock = self.pin_table.pop(rid, None)
+        self.pin_table[rid] = new_lock
+        if old_lock is not None:
+            self.tree_cache.unlock(old_lock)
+        logger.info(
+            f"joint-checkpoint: pinned rid={rid} len={pinned_len} "
+            f"(requested up_to={recv_req.up_to})"
+        )
+        return PinReqOutput(success=True, pinned_len=pinned_len)
+
+    def unpin_request(self, recv_req: UnpinReqInput):
+        if not self.enable_joint_checkpoint:
+            return UnpinReqOutput(
+                success=False, message="--enable-joint-checkpoint is not set"
+            )
+        lock = self.pin_table.pop(recv_req.rid, None)
+        if lock is None:
+            return UnpinReqOutput(
+                success=False, message=f"no pin for request {recv_req.rid}"
+            )
+        self.tree_cache.unlock(lock)
+        logger.info(f"joint-checkpoint: unpinned rid={recv_req.rid}")
+        return UnpinReqOutput(success=True)
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:
