@@ -159,6 +159,7 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
+    SetPriorityReqInput,
     SlowDownReqInput,
     UnloadLoRAAdapterReqInput,
     UnpinReqInput,
@@ -1783,6 +1784,17 @@ async def watermark_request(
     """Joint checkpoint: report how many output tokens of this request the
     consumer has read; drives the lookahead pause/resume budget."""
     result = await _global_state.tokenizer_manager.watermark_request(obj)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.post("/set_priority")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def set_priority(obj: Annotated[SetPriorityReqInput, Body()], request: Request):
+    """Joint checkpoint: change the scheduling priority of a waiting or
+    in-flight request (needs --enable-joint-checkpoint and
+    --enable-priority-scheduling)."""
+    result = await _global_state.tokenizer_manager.set_priority(obj)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 

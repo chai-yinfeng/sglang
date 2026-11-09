@@ -2494,6 +2494,23 @@ class WatermarkReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class SetPriorityReqInput(BaseReq, kw_only=True):
+    """Joint checkpoint P4: change ``req.priority`` of the waiting, running,
+    chunked or paused request ``rid`` at runtime (needs priority scheduling).
+    Waiting-queue order and preemption read the new value from the next
+    scheduling step on; see ``SetPriorityReqOutput.message`` for how the
+    tree-node eviction priority follows."""
+
+    priority: int
+
+
+class SetPriorityReqOutput(BaseReq, kw_only=True):
+    success: bool
+    old_priority: Optional[int] = None
+    new_priority: Optional[int] = None
+    message: str = ""
+
+
 class OpenSessionReqInput(BaseReq, kw_only=True):
     capacity_of_str_len: int
     session_id: Optional[str] = None

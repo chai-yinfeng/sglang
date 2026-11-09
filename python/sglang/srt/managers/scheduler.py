@@ -183,6 +183,8 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqInput,
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
+    SetPriorityReqInput,
+    SetPriorityReqOutput,
     ShutdownReq,
     SlowDownReqInput,
     SlowDownReqOutput,
@@ -1866,6 +1868,7 @@ class Scheduler(
                 (PauseReqInput, self.pause_request),
                 (ResumeReqInput, self.resume_request),
                 (WatermarkReqInput, self.watermark_request),
+                (SetPriorityReqInput, self.set_priority),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -6428,6 +6431,60 @@ class Scheduler(
             success=True,
             output_len=len(req.output_ids),
             paused=req.rid in self.paused_reqs,
+        )
+
+    def set_priority(self, recv_req: SetPriorityReqInput):
+        """Joint checkpoint P4: change ``req.priority`` of a waiting, running,
+        chunked or paused request. Scheduling reads the field directly, so
+        the waiting-queue sort and preempt_to_schedule see the new value from
+        the next step. Tree eviction priority: a raise is applied now to the
+        nodes on the request's cached path (monotone, like insert); a lower
+        value is not written to existing nodes, which other requests may
+        share, and only reaches nodes written by later checkpoint/insert."""
+        if not self.enable_joint_checkpoint:
+            return SetPriorityReqOutput(
+                success=False, message="--enable-joint-checkpoint is not set"
+            )
+        if not self.enable_priority_scheduling:
+            return SetPriorityReqOutput(
+                success=False, message="--enable-priority-scheduling is not set"
+            )
+        rid = recv_req.rid
+        req = self._find_inflight_req(rid)
+        if req is None:
+            req = next((r for r in self.waiting_queue if r.rid == rid), None)
+        if req is None or req.finished():
+            return SetPriorityReqOutput(
+                success=False, message=f"request {rid} is not waiting or running"
+            )
+        old_priority = req.priority
+        new_priority = int(recv_req.priority)
+        req.priority = new_priority
+
+        message = ""
+        if old_priority is not None and new_priority < old_priority:
+            message = (
+                "lowered: existing tree nodes keep their priority; the new value "
+                "applies to nodes written by later checkpoint/insert"
+            )
+        elif req.kv.holds_kv and req.last_node is not None:
+            raised = getattr(self.tree_cache, "raise_path_priority", None)
+            if raised is not None and raised(req.last_node, new_priority):
+                message = "raised on the request's cached path"
+            else:
+                message = (
+                    "tree node priority not updated in place; the new value "
+                    "applies to nodes written by later checkpoint/insert"
+                )
+        logger.info(
+            f"joint-checkpoint: set_priority rid={rid} "
+            f"{old_priority} -> {new_priority} ({message or 'not in tree yet'})"
+        )
+        return SetPriorityReqOutput(
+            success=True,
+            old_priority=old_priority,
+            new_priority=new_priority,
+            message=message,
         )
 
     def maybe_sleep_on_idle(self):

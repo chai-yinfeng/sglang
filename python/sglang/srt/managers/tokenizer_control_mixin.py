@@ -78,6 +78,8 @@ from sglang.srt.managers.io_struct import (
     SendWeightsToRemoteInstanceReqOutput,
     SetInternalStateReq,
     SetInternalStateReqOutput,
+    SetPriorityReqInput,
+    SetPriorityReqOutput,
     SlowDownReqInput,
     SlowDownReqOutput,
     UnloadLoRAAdapterReqInput,
@@ -159,6 +161,7 @@ _COMMUNICATOR_SPECS = [
     ("pause_request", PauseReqOutput),
     ("resume_request", ResumeReqOutput),
     ("watermark_request", WatermarkReqOutput),
+    ("set_priority", SetPriorityReqOutput),
 ]
 
 
@@ -962,6 +965,13 @@ class TokenizerControlMixin:
         """Joint checkpoint: report the consumer's output watermark for a request."""
         self.auto_create_handle_loop()
         return (await self.watermark_request_communicator(obj))[0]
+
+    async def set_priority(
+        self: TokenizerManager, obj: SetPriorityReqInput
+    ) -> SetPriorityReqOutput:
+        """Joint checkpoint: change a live request's scheduling priority."""
+        self.auto_create_handle_loop()
+        return (await self.set_priority_communicator(obj))[0]
 
     async def pd_role_switch(
         self: TokenizerManager,

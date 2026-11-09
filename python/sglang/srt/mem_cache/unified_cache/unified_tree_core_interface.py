@@ -294,6 +294,13 @@ class UnifiedTreeCoreInterface(ABC):
         """Return input indices in depth-first, subtree-weight order."""
         ...
 
+    def raise_path_priority(self, node_id: NodeId, priority: int) -> bool:
+        """Joint checkpoint P4: ``node.priority = max(node.priority, priority)``
+        on the root-to-``node_id`` path, the same monotone update insert does.
+        Returns False when the backend cannot update node priority in place
+        (the next insert along the path still applies the new value)."""
+        return False
+
     @abstractmethod
     def collect_path_info(
         self, end_node_ids: Sequence[NodeId]

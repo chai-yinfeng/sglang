@@ -684,6 +684,13 @@ class UnifiedTreeCore(UnifiedTreeCoreInterface):
     def dfs_weight_order(self, node_ids: Sequence[NodeId]) -> list[int]:
         return _dfs_weight_order(self.root_node, node_ids, self.node_by_id)
 
+    def raise_path_priority(self, node_id: NodeId, priority: int) -> bool:
+        node = self.node_by_id(node_id)
+        while node is not None:
+            node.priority = max(node.priority, priority)
+            node = node.parent
+        return True
+
     def collect_path_info(
         self, end_node_ids: Sequence[NodeId]
     ) -> tuple[tuple[TreePathNodeInfo, ...], ...]:

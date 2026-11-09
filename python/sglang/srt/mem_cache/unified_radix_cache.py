@@ -3971,3 +3971,12 @@ class UnifiedRadixCache(BasePrefixCache):
 
     def dfs_weight_order(self, node_handles: Sequence[NodeId]) -> list[int]:
         return self.tree_core.dfs_weight_order(node_handles)
+
+    def raise_path_priority(self, node_id: NodeId, priority: int) -> bool:
+        """Joint checkpoint P4 (scheduler.set_priority): raise the eviction
+        priority of the nodes on the path ending at ``node_id``. False when
+        the cache is disabled, the node is a session's virtual node, or the
+        tree core cannot update node priority in place."""
+        if self.disable or is_virtual_node(node_id):
+            return False
+        return self.tree_core.raise_path_priority(node_id, priority)
