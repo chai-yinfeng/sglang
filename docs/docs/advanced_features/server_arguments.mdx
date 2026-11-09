@@ -582,7 +582,7 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--enable-joint-checkpoint`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the joint-checkpoint control primitives on the radix cache: `/pin_request` and `/unpin_request` hold a running request's KV prefix in the tree independent of the request's lifetime, and `/abort_request` accepts `discard=true` to release a request's KV without inserting it into the tree.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Enable the joint-checkpoint control primitives on the radix cache: `/pin_request` and `/unpin_request` hold a running request's KV prefix in the tree independent of the request's lifetime, `/abort_request` accepts `discard=true` to release a request's KV without inserting it into the tree, and a streaming-session `/generate` with `session_params.truncate_to` cuts the session's in-flight request at that position and continues from it in the same scheduling step.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`False`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>bool flag (set to enable)</td>
     </tr>

@@ -93,7 +93,7 @@ class Memory(msgspec.Struct):
     ] = None
     enable_joint_checkpoint: A[
         bool,
-        "Enable the joint-checkpoint control primitives on the radix cache: /pin_request and /unpin_request hold a running request's KV prefix in the tree independent of the request's lifetime, and /abort_request accepts discard=true to release a request's KV without inserting it into the tree.",
+        "Enable the joint-checkpoint control primitives on the radix cache: /pin_request and /unpin_request hold a running request's KV prefix in the tree independent of the request's lifetime, /abort_request accepts discard=true to release a request's KV without inserting it into the tree, and a streaming-session /generate with session_params.truncate_to cuts the session's in-flight request at that position and continues from it in the same scheduling step.",
     ] = False
     jc_pause_timeout_s: A[
         float,

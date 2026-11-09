@@ -1199,6 +1199,12 @@ class Req(ReqDllmMixin):
         self.jc_watermark: int = 0
         self.jc_pause_reason: Optional[str] = None
         self.jc_paused_at: Optional[float] = None
+        # Joint checkpoint P3 truncate: the absolute position this request was
+        # cut at (its streaming-session slot keeps KV [0, here)), and whether
+        # it is the successor of a truncated request, admitted ahead of the
+        # waiting queue.
+        self.jc_truncate_to: Optional[int] = None
+        self.jc_admit_first: bool = False
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

@@ -3101,6 +3101,26 @@ class Scheduler(
         ):
             # Session exists and is not closing: create request from session
             session = self.session_controller.get(session_id)
+            truncate = recv_req.session_params.truncate_to is not None
+            if truncate:
+                # Joint checkpoint P3: cut the session's in-flight request
+                # first, so create_req below appends to the kept prefix.
+                error_msg = self._jc_truncate_session(session, recv_req)
+                if error_msg is not None:
+                    req = self._create_generation_req(
+                        recv_req,
+                        recv_req.rid,
+                        recv_req.input_text,
+                        recv_req.input_ids,
+                        recv_req.sampling_params,
+                        vocab_size=self.model_config.vocab_size,
+                        http_worker_ipc=recv_req.http_worker_ipc,
+                    )
+                    req.tokenizer = self.tokenizer
+                    req.set_finish_with_abort(error_msg)
+                    self.init_req_max_new_tokens(req)
+                    self._add_request_to_queue(req)
+                    return
             req = session.create_req(
                 recv_req,
                 self.tokenizer,
@@ -3109,6 +3129,10 @@ class Scheduler(
                 disagg_mode=self.disaggregation_mode,
                 req_factory=partial(self._create_generation_req, recv_req),
             )
+            if truncate:
+                # Its prefix is already held by the slot; only the appended
+                # tokens need budget, so it goes ahead of the waiting queue.
+                req.jc_admit_first = True
             if self.enable_session_radix_cache:
                 req.session_generation = self.tree_cache.ensure_session_generation(
                     session_id
@@ -4165,6 +4189,8 @@ class Scheduler(
             running_batch,
             processed_tokens=self.processed_tokens_counter,
         )
+        if self.enable_joint_checkpoint:
+            self._jc_front_waiting_queue()
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -6228,6 +6254,109 @@ class Scheduler(
             if req.rid == rid:
                 return req
         return None
+
+    def _jc_session_inflight_req(self, session) -> Optional[Req]:
+        """The unfinished request a streaming session is running (or still
+        waiting to be admitted), if any."""
+        candidates = list(self.paused_reqs.values())
+        if self.chunked_req is not None:
+            candidates.append(self.chunked_req)
+        candidates.extend(self.collect_inflight_reqs())
+        candidates.extend(self.waiting_queue)
+        for req in candidates:
+            if req.session is session and not req.finished():
+                return req
+        return None
+
+    def _jc_truncate_session(
+        self, session, recv_req: TokenizedGenerateReqInput
+    ) -> Optional[str]:
+        """Joint checkpoint P3 (truncate, path A'): finish the streaming
+        session's in-flight request at ``session_params.truncate_to`` without
+        running it again, keeping KV [0, truncate_to) in the session slot.
+        Returns an error message, or None when the slot is ready for the
+        successor (``recv_req``) to be created as a plain streaming append.
+
+        Runs between scheduler steps (request intake). The cut request stays
+        in whatever batch holds it until the next filter_batch drops it as
+        finished; a result still in flight for it under overlap is ignored by
+        process_batch_result (finished request) and its final chunk is
+        streamed here, so the late result does not stream it again.
+        """
+        if not self.enable_joint_checkpoint:
+            return "session_params.truncate_to requires --enable-joint-checkpoint"
+        if not session.streaming:
+            return "session_params.truncate_to is only supported for streaming sessions"
+        pos = int(recv_req.session_params.truncate_to)
+        req = self._jc_session_inflight_req(session)
+        if req is None:
+            return (
+                f"streaming session {session.session_id} has no in-flight request "
+                "to truncate"
+            )
+        target_rid = recv_req.session_params.rid
+        if target_rid is not None and target_rid != req.rid:
+            return (
+                f"session_params.rid={target_rid} is not the in-flight request "
+                f"{req.rid}"
+            )
+        if req is self.chunked_req or not req.kv.holds_kv:
+            return f"request {req.rid} has not finished prefill"
+        if req.to_finish is not None:
+            return f"request {req.rid} is finishing"
+        input_len = len(req.origin_input_ids)
+        total_len = input_len + len(req.output_ids)
+        if not input_len <= pos <= total_len:
+            return (
+                f"truncate_to={pos} is outside [{input_len}, {total_len}] "
+                f"for request {req.rid}"
+            )
+        if pos < req.kv.cache_protected_len:
+            # The slot's tree lock sits on the node holding [0, protected);
+            # moving it down the tree is not implemented. Unreachable while
+            # pos >= len(input_ids) >= the published first-turn prompt.
+            return (
+                f"truncate_to={pos} is below the tree-protected prefix "
+                f"{req.kv.cache_protected_len} of request {req.rid}"
+            )
+
+        # Finish the request here, at a step boundary, without a forward:
+        # like retraction, the KV past the cut is freed while a result may be
+        # in flight for it. The abort reason lets a tokenizer_manager that
+        # sees this rid only through the stream close it normally.
+        req.jc_truncate_to = pos
+        req.finished_len = pos - input_len
+        req.output_ids = req.output_ids[: req.finished_len]
+        req.finished_reason = FINISH_ABORT(
+            f"Truncated to position {pos} by joint-checkpoint truncate."
+        )
+        # Final chunk for the cut request's stream before its KV goes.
+        self.output_streamer.stream_output([req], req.return_logprob)
+
+        note_finished = getattr(self.draft_worker, "note_request_finished", None)
+        if note_finished is not None:
+            note_finished(rid=req.rid, natural_stop=False)
+        # release_kv_cache -> claim_kv_row -> StreamingSession.try_cache_finished_req
+        # keeps the record in the slot with kv_committed_len == pos, frees the
+        # tail, trims output_ids to finished_len and runs session.finish_req.
+        release_kv_cache(req, self.tree_cache, checkpoint=True)
+        req.time_stats.set_completion_time()
+        logger.info(
+            f"joint-checkpoint: truncated rid={req.rid} to pos={pos} "
+            f"(input_len={input_len}, was {total_len}); successor rid={recv_req.rid}"
+        )
+        return None
+
+    def _jc_front_waiting_queue(self) -> None:
+        """Joint checkpoint P3: after the policy sort, move the successors of
+        truncated requests (jc_admit_first) to the head of the waiting queue,
+        keeping their relative order. Their prefix is already held by the
+        session slot, so they only need budget for the appended tokens."""
+        if not any(req.jc_admit_first for req in self.waiting_queue):
+            return
+        first = [req for req in self.waiting_queue if req.jc_admit_first]
+        rest = [req for req in self.waiting_queue if not req.jc_admit_first]
+        self.waiting_queue[:] = first + rest
 
     def pin_request(self, recv_req: PinReqInput):
         """Joint checkpoint P1: insert the running request's KV prefix

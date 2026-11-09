@@ -154,6 +154,15 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # from the accumulated context so the new turn sees only the original input.
     # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
+    # Joint checkpoint P3 (--enable-joint-checkpoint, streaming sessions only):
+    # absolute token position (index into the in-flight turn's
+    # ``input_ids + output_ids``, ``>= len(input_ids)``) to truncate the
+    # session's in-flight request to. The scheduler finishes that request at
+    # the next step boundary (finish_reason abort, message starting with
+    # "Truncated"), keeps its KV [0, truncate_to) in the session slot, and
+    # admits this request -- whose ``input_ids`` are the tokens to append
+    # after the cut -- ahead of the waiting queue in the same step.
+    truncate_to: Optional[int] = None
 
 
 # Type definitions for multimodal input data

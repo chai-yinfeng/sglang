@@ -157,7 +157,12 @@ class StreamingSession:
         """Keeps a finished or retracted turn's record in the session slot.
         An aborted turn gets the record and the tree lock back and is released
         like any request (returns False); the session re-prefills from its
-        last finished request next turn."""
+        last finished request next turn.
+
+        A turn cut by joint-checkpoint truncate (``req.jc_truncate_to`` set)
+        finishes with an abort reason but takes the keep path: its
+        ``finished_len`` is the cut, so the slot keeps KV [0, truncate_to) and
+        the successor turn borrows it with that prefix."""
         if not _is_streaming(req):
             return False
 
@@ -165,7 +170,10 @@ class StreamingSession:
 
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
-        if isinstance(req.finished_reason, FINISH_ABORT):
+        if (
+            isinstance(req.finished_reason, FINISH_ABORT)
+            and getattr(req, "jc_truncate_to", None) is None
+        ):
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
