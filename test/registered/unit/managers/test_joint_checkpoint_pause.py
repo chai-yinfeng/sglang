@@ -39,12 +39,13 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 PROMPT_LEN = 3
 
 
-def make_req(rid, output_len, lookahead=None, row=0) -> Req:
+def make_req(rid, output_len, lookahead=None, row=0, **kwargs) -> Req:
     req = Req(
         rid=rid,
         origin_input_text="",
         origin_input_ids=array("q", [1, 2, 3]),
         sampling_params=SamplingParams(lookahead=lookahead, max_new_tokens=1000),
+        **kwargs,
     )
     req.output_ids.extend(range(100, 100 + output_len))
     req.kv.req_pool_idx = row
@@ -59,7 +60,7 @@ class TestJointCheckpointPause(CustomTestCase):
 
     # ------------------------------------------------------------ fixtures
 
-    def make_batch(self, scheduler, reqs) -> ScheduleBatch:
+    def make_batch(self, scheduler, reqs, multimodal_inputs=None) -> ScheduleBatch:
         batch = ScheduleBatch(reqs=list(reqs), batch_is_full=False)
         batch.device = "cpu"
         batch.req_to_token_pool = scheduler.req_to_token_pool
@@ -68,7 +69,13 @@ class TestJointCheckpointPause(CustomTestCase):
         batch.model_config = MagicMock(is_encoder_decoder=False)
         batch.sampling_info = MagicMock()
         batch.spec_info = None
-        batch.multimodal_inputs = None
+        batch.multimodal_inputs = multimodal_inputs
+        # Mirror _build_hisparse_decode_batch, which fills the logprob lists
+        # from origin_input_ids rather than the request's token_ids_logprob.
+        batch.return_logprob = any(r.return_logprob for r in reqs)
+        if batch.return_logprob:
+            batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
         rows = [r.kv.req_pool_idx for r in reqs]
         lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
         batch.req_pool_indices = torch.tensor(rows, dtype=torch.int64)
@@ -192,6 +199,61 @@ class TestJointCheckpointPause(CustomTestCase):
         batch = self.step(s)
         self.assertEqual([r.rid for r in batch.reqs], ["a"])
         self.assertEqual(batch.req_pool_indices.tolist(), [0])
+
+    def test_resume_merges_into_prefill_shaped_running_batch(self):
+        # prepare_for_extend leaves multimodal_inputs as a list aligned with
+        # reqs (all None for text); the resume batch must merge into it.
+        a = make_req("a", output_len=6, lookahead=4, row=0)
+        b = make_req("b", output_len=6, row=1)
+        c = make_req("c", output_len=6, row=2)
+        s = self.make_scheduler([a, b, c])
+        s.running_batch.multimodal_inputs = [None, None, None]
+        batch = self.step(s)
+        self.assertEqual([r.rid for r in batch.reqs], ["b", "c"])
+        self.assertEqual(batch.multimodal_inputs, [None, None])
+        s.watermark_request(WatermarkReqInput(rid="a", watermark=2))
+        batch = self.step(s)
+        self.assertEqual([r.rid for r in batch.reqs], ["b", "c", "a"])
+        self.assertEqual(batch.req_pool_indices.tolist(), [1, 2, 0])
+        self.assertEqual(len(batch.multimodal_inputs), len(batch.reqs))
+        self.assertEqual(batch.multimodal_inputs, [None, None, None])
+        # The merged batch filters by index without drifting.
+        batch.filter_batch(reqs_to_exclude=[c])
+        self.assertEqual([r.rid for r in batch.reqs], ["b", "a"])
+        self.assertEqual(batch.multimodal_inputs, [None, None])
+
+    def test_prefill_batch_merges_into_resumed_running_batch(self):
+        # running_batch = resume_batch when nothing else runs; a prefill batch
+        # merged in afterwards must keep multimodal_inputs aligned with reqs.
+        a = make_req("a", output_len=6, lookahead=4, row=0)
+        s = self.make_scheduler([a])
+        self.assertTrue(self.step(s).is_empty())
+        s.watermark_request(WatermarkReqInput(rid="a", watermark=6))
+        batch = self.step(s)
+        self.assertEqual([r.rid for r in batch.reqs], ["a"])
+        self.assertEqual(len(batch.multimodal_inputs), 1)
+        p = make_req("p", output_len=1, row=3)
+        prefill = self.make_batch(s, [p], multimodal_inputs=[None])
+        batch.merge_batch(prefill)
+        self.assertEqual([r.rid for r in batch.reqs], ["a", "p"])
+        self.assertEqual(batch.req_pool_indices.tolist(), [0, 3])
+        self.assertEqual(batch.multimodal_inputs, [None, None])
+
+    def test_resume_keeps_token_ids_logprobs_of_request(self):
+        a = make_req(
+            "a", output_len=6, lookahead=4, row=0,
+            return_logprob=True, token_ids_logprob=[7],
+        )
+        b = make_req("b", output_len=6, row=1)
+        s = self.make_scheduler([a, b])
+        s.running_batch.multimodal_inputs = [None, None]
+        self.step(s)
+        s.watermark_request(WatermarkReqInput(rid="a", watermark=2))
+        batch = self.step(s)
+        self.assertEqual([r.rid for r in batch.reqs], ["b", "a"])
+        self.assertTrue(batch.return_logprob)
+        self.assertEqual(batch.top_logprobs_nums, [0, 0])
+        self.assertEqual(batch.token_ids_logprobs, [None, [7]])
 
     def test_watermark_is_monotonic_and_clamped(self):
         a = make_req("a", output_len=6, lookahead=4)

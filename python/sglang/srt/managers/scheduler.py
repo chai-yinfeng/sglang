@@ -6367,6 +6367,15 @@ class Scheduler(
             # A decode batch from requests that already hold their KV; the
             # last output token is relayed as the next input.
             resume_batch = self._build_hisparse_decode_batch(to_resume)
+            # The builder leaves the per-request lists unset; shape them like
+            # prepare_for_extend does so merge_batch / filter_batch stay
+            # aligned with reqs when this batch merges with a prefill batch
+            # (or a prefill batch later merges into it).
+            resume_batch.multimodal_inputs = [r.multimodal_inputs for r in to_resume]
+            if resume_batch.return_logprob:
+                resume_batch.token_ids_logprobs = [
+                    r.logprob.token_ids_logprob for r in to_resume
+                ]
             if running_batch.is_empty():
                 running_batch = resume_batch
             else:
