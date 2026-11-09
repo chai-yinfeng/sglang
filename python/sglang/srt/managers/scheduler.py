@@ -6288,13 +6288,10 @@ class Scheduler(
         if not session.streaming:
             return "session_params.truncate_to is only supported for streaming sessions"
         pos = int(recv_req.session_params.truncate_to)
+        target_rid = recv_req.session_params.rid
         req = self._jc_session_inflight_req(session)
         if req is None:
-            return (
-                f"streaming session {session.session_id} has no in-flight request "
-                "to truncate"
-            )
-        target_rid = recv_req.session_params.rid
+            return self._jc_truncate_finished_turn(session, pos, target_rid)
         if target_rid is not None and target_rid != req.rid:
             return (
                 f"session_params.rid={target_rid} is not the in-flight request "
@@ -6325,8 +6322,7 @@ class Scheduler(
         # in flight for it. The abort reason lets a tokenizer_manager that
         # sees this rid only through the stream close it normally.
         req.jc_truncate_to = pos
-        req.finished_len = pos - input_len
-        req.output_ids = req.output_ids[: req.finished_len]
+        self._jc_cut_token_ledger(req, pos)
         req.finished_reason = FINISH_ABORT(
             f"Truncated to position {pos} by joint-checkpoint truncate."
         )
@@ -6346,6 +6342,56 @@ class Scheduler(
             f"(input_len={input_len}, was {total_len}); successor rid={recv_req.rid}"
         )
         return None
+
+    def _jc_truncate_finished_turn(
+        self, session, pos: int, target_rid: Optional[str]
+    ) -> Optional[str]:
+        """Joint checkpoint P3 on a streaming session whose last turn already
+        finished (the client interrupts while its output is still being
+        played): cut the slot's KV and the turn's token ledger to ``pos`` so
+        the successor appends to prompt[:pos]. Nothing is streamed; the turn
+        keeps its finish reason."""
+        if not session.req_nodes:
+            return f"streaming session {session.session_id} has nothing to truncate"
+        [node] = session.req_nodes.values()
+        req = node.req
+        if target_rid is not None and target_rid != req.rid:
+            return f"session_params.rid={target_rid} is not the last turn {req.rid}"
+        input_len = len(req.origin_input_ids)
+        finished_len = (
+            req.finished_len if req.finished_len is not None else len(req.output_ids)
+        )
+        total_len = input_len + min(finished_len, len(req.output_ids))
+        if not input_len <= pos <= total_len:
+            return (
+                f"truncate_to={pos} is outside [{input_len}, {total_len}] "
+                f"for finished request {req.rid}"
+            )
+        error_msg = self.tree_cache.session.truncate_finished_turn(req, pos)
+        if error_msg is not None:
+            return f"{error_msg} (request {req.rid})"
+        self._jc_cut_token_ledger(req, pos)
+        # finish_req recorded the uncut fill length; the share path trims to it.
+        session.committed_fill_len = len(req.full_untruncated_fill_ids)
+        logger.info(
+            f"joint-checkpoint: truncated finished rid={req.rid} to pos={pos} "
+            f"(input_len={input_len}, was {total_len})"
+        )
+        return None
+
+    @staticmethod
+    def _jc_cut_token_ledger(req: Req, pos: int) -> None:
+        """Cut output_ids, finished_len and the fill array at absolute ``pos``
+        so they read as prompt[:pos] for the streaming share path."""
+        req.finished_len = pos - len(req.origin_input_ids)
+        req.output_ids = req.output_ids[: req.finished_len]
+        fill = req.full_untruncated_fill_ids
+        if (
+            fill is not req.origin_input_ids
+            and fill is not req.origin_input_ids_unpadded
+            and len(fill) > pos
+        ):
+            del fill[pos:]
 
     def _jc_front_waiting_queue(self) -> None:
         """Joint checkpoint P3: after the policy sort, move the successors of

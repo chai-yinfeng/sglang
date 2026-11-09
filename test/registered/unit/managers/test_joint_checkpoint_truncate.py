@@ -28,7 +28,12 @@ import torch
 
 from sglang.srt.disaggregation.utils import DisaggregationMode
 from sglang.srt.managers.io_struct import SessionParams
-from sglang.srt.managers.schedule_batch import FINISH_ABORT, Req, ScheduleBatch
+from sglang.srt.managers.schedule_batch import (
+    FINISH_ABORT,
+    FINISH_LENGTH,
+    Req,
+    ScheduleBatch,
+)
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
@@ -196,6 +201,8 @@ class TestJointCheckpointTruncate(CustomTestCase):
         )
         self.assertFalse(req.finished())
         req.output_ids.extend(range(100, 100 + output_len))
+        # prepare_for_decode keeps the fill array at origin + output_ids.
+        req.refresh_fill_ids()
         total = len(PROMPT) + output_len
         req.kv.req_pool_idx = 0
         req.kv.cache_protected_len = protected_len
@@ -205,6 +212,14 @@ class TestJointCheckpointTruncate(CustomTestCase):
         # First row allocation: the session takes the record and the lock.
         self.cache.maybe_hand_to_session(req)
         return req
+
+    def finish_turn(self, req: Req) -> None:
+        """The turn ends naturally (length); its record stays in the slot."""
+        req.finished_reason = FINISH_LENGTH(length=len(req.output_ids))
+        req.finished_len = len(req.output_ids)
+        release_kv_cache(req, self.cache, checkpoint=True)
+        self.assertFalse(self.session._inflight)
+        self.cache.token_to_kv_pool_allocator.clear()
 
     def make_batch(self, reqs) -> ScheduleBatch:
         batch = ScheduleBatch(reqs=list(reqs), batch_is_full=False)
@@ -282,10 +297,10 @@ class TestJointCheckpointTruncate(CustomTestCase):
         _, err = self.truncate(s, 4)
         self.assertIn("streaming", err)
 
-    def test_rejected_without_inflight_request(self):
+    def test_rejected_on_empty_session(self):
         s = self.make_scheduler([])
         _, err = self.truncate(s, len(PROMPT))
-        self.assertIn("no in-flight request", err)
+        self.assertIn("nothing to truncate", err)
 
     def test_rejected_out_of_range_and_wrong_rid(self):
         old = self.start_turn(output_len=5)
@@ -368,6 +383,10 @@ class TestJointCheckpointTruncate(CustomTestCase):
         self.assertFalse(self.session._inflight)
         self.assertEqual(list(self.session.req_nodes), ["t1"])
         self.assertEqual(self.session.committed_origin_len, len(PROMPT))
+        # The fill array is cut with it, so the share path carries it over
+        # instead of rebuilding.
+        self.assertEqual(list(old.full_untruncated_fill_ids), PROMPT + [100, 101])
+        self.assertEqual(self.session.committed_fill_len, pos)
 
         # The next step's filter drops it from the running batch.
         s.running_batch.filter_batch()
@@ -410,6 +429,8 @@ class TestJointCheckpointTruncate(CustomTestCase):
         s, old, new = self.successor_after_cut(pos, append=(7, 8))
         self.assertFalse(new.finished(), getattr(new.to_finish, "message", None))
         self.assertEqual(list(new.origin_input_ids), PROMPT + [100, 101, 7, 8])
+        # Carried fill array, no O(context) rebuild.
+        self.assertEqual(list(new.full_untruncated_fill_ids), PROMPT + [100, 101, 7, 8])
         self.assertIs(new.session, self.session)
         self.assertTrue(self.session._inflight)
 
@@ -456,6 +477,109 @@ class TestJointCheckpointTruncate(CustomTestCase):
         # Idempotent and order-preserving for everyone else.
         s._jc_front_waiting_queue()
         self.assertEqual(s.waiting_queue, [new, others[0], others[1], others[2]])
+
+    # ------------------------------------------------------------ finished turn
+
+    def test_truncate_finished_turn_cuts_slot_and_ledger(self):
+        old = self.start_turn(output_len=5)
+        self.finish_turn(old)
+        slot = self.cache.session.slots["s"]
+        slot_lock = slot.lock
+        self.assertEqual(slot.kv.kv_committed_len, len(PROMPT) + 5)
+        s = self.make_scheduler([])
+        pos = len(PROMPT) + 2
+
+        recv, err = self.truncate(s, pos, append=(7, 8))
+        self.assertIsNone(err)
+
+        # Nothing streamed, finish reason untouched, ledger cut.
+        s.output_streamer.stream_output.assert_not_called()
+        self.assertIsInstance(old.finished_reason, FINISH_LENGTH)
+        self.assertEqual(list(old.output_ids), [100, 101])
+        self.assertEqual(old.finished_len, 2)
+        self.assertEqual(list(old.full_untruncated_fill_ids), PROMPT + [100, 101])
+        self.assertEqual(self.session.committed_fill_len, pos)
+        # Slot cut at pos, tail freed, lock untouched.
+        self.assertEqual(slot.kv.kv_committed_len, pos)
+        self.assertEqual(slot.kv.kv_allocated_len, pos)
+        self.assertIs(slot.lock, slot_lock)
+        self.assertEqual(self.cache.unlocked, [])
+        self.assertEqual(
+            self.cache.token_to_kv_pool_allocator.freed_positions(),
+            list(range(pos, len(PROMPT) + 5)),
+        )
+
+        # Successor: plain append on the cut history, prefix at pos.
+        new = self.session.create_req(recv, tokenizer=None, vocab_size=VOCAB)
+        self.assertFalse(new.finished())
+        self.assertEqual(list(new.origin_input_ids), PROMPT + [100, 101, 7, 8])
+        self.assertEqual(list(new.full_untruncated_fill_ids), PROMPT + [100, 101, 7, 8])
+        new.init_next_round_input(self.cache)
+        self.assertIs(new.kv, slot.kv)
+        self.assertEqual(new.prefix_len, pos)
+        self.assertEqual(len(new.full_untruncated_fill_ids) - new.prefix_len, 2)
+
+    def test_truncate_finished_turn_twice(self):
+        old = self.start_turn(output_len=5)
+        self.finish_turn(old)
+        slot = self.cache.session.slots["s"]
+        s = self.make_scheduler([])
+        pos1, pos2 = len(PROMPT) + 4, len(PROMPT) + 1
+
+        _, err = self.truncate(s, pos1)
+        self.assertIsNone(err)
+        self.assertEqual(slot.kv.kv_allocated_len, pos1)
+        _, err = self.truncate(s, pos2)
+        self.assertIsNone(err)
+
+        self.assertEqual(slot.kv.kv_committed_len, pos2)
+        self.assertEqual(slot.kv.kv_allocated_len, pos2)
+        self.assertEqual(list(old.output_ids), [100])
+        self.assertEqual(self.session.committed_fill_len, pos2)
+        self.assertEqual(
+            self.cache.token_to_kv_pool_allocator.freed_positions(),
+            list(range(pos2, len(PROMPT) + 5)),
+        )
+        recv = _recv("t2", (7,), truncate_to=pos2)
+        new = self.session.create_req(recv, tokenizer=None, vocab_size=VOCAB)
+        self.assertEqual(list(new.origin_input_ids), PROMPT + [100, 7])
+        new.init_next_round_input(self.cache)
+        self.assertEqual(new.prefix_len, pos2)
+
+    def test_truncate_finished_turn_rejections(self):
+        s = self.make_scheduler([])
+        _, err = self.truncate(s, len(PROMPT))
+        self.assertIn("nothing to truncate", err)
+
+        old = self.start_turn(output_len=5)
+        self.finish_turn(old)
+        slot = self.cache.session.slots["s"]
+        total = len(PROMPT) + 5
+        for pos in (len(PROMPT) - 1, total + 1):
+            _, err = self.truncate(s, pos)
+            self.assertIn("outside", err, pos)
+        _, err = self.truncate(s, len(PROMPT) + 1, session_rid="someone-else")
+        self.assertIn("not the last turn", err)
+        slot.kv.cache_protected_len = len(PROMPT) + 3
+        _, err = self.truncate(s, len(PROMPT) + 2)
+        self.assertIn("tree-protected prefix", err)
+        slot.kv.cache_protected_len = 0
+        # Nothing was cut by the rejected calls.
+        self.assertEqual(slot.kv.kv_committed_len, total)
+        self.assertEqual(list(old.output_ids), list(range(100, 105)))
+        self.assertEqual(self.cache.token_to_kv_pool_allocator.freed_positions(), [])
+
+        self.cache.session.release_session("s")
+        _, err = self.truncate(s, len(PROMPT) + 1)
+        self.assertIn("holds no KV", err)
+
+    def test_finished_turn_truncate_rejected_without_flag(self):
+        old = self.start_turn(output_len=5)
+        self.finish_turn(old)
+        s = self.make_scheduler([], enable=False)
+        _, err = self.truncate(s, len(PROMPT) + 1)
+        self.assertIn("--enable-joint-checkpoint", err)
+        self.assertEqual(list(old.output_ids), list(range(100, 105)))
 
     # ------------------------------------------------------------ flag off: upstream abort path
 
