@@ -191,6 +191,7 @@ impl TryFrom<api::SamplingParams> for SamplingParams {
                 key: watermark.key,
                 context_window: watermark.context_window,
             }),
+            lookahead: p.lookahead,
             ..defaults
         })
     }
@@ -497,6 +498,16 @@ mod tests {
         assert_eq!(watermark.key.as_deref(), Some(key));
         assert_eq!(watermark.context_window, Some(4));
         assert!(!format!("{p:?}").contains(key));
+    }
+
+    #[test]
+    fn lookahead_crosses_generated_schema() {
+        let p: api::SamplingParams =
+            serde_json::from_value(serde_json::json!({"lookahead": 16})).unwrap();
+        let p = SamplingParams::try_from(p).unwrap();
+        assert_eq!(p.lookahead, Some(16));
+        let p: api::SamplingParams = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(SamplingParams::try_from(p).unwrap().lookahead, None);
     }
 
     /// The protobuf entry fills the same keys the JSON entry does: a set field

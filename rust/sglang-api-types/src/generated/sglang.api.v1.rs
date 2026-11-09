@@ -310,6 +310,10 @@ pub struct SamplingParams {
     /// grammar compilation, matching the legacy native gRPC contract.
     #[prost(string, repeated, tag = "28")]
     pub choice: ::prost::alloc::vec::Vec<::prost::alloc::string::String>,
+    /// Joint checkpoint (--enable-joint-checkpoint): decode budget ahead of the
+    /// consumer's watermark (/watermark). Absent = no budget; must be >= 0.
+    #[prost(int64, optional, tag = "29")]
+    pub lookahead: ::core::option::Option<i64>,
 }
 #[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
 pub struct WatermarkRequestConfig {

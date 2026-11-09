@@ -233,6 +233,10 @@ pub struct SamplingParams {
     pub custom_params: Option<BTreeMap<String, CustomParamValue>>,
     #[serde(default)]
     pub watermark: Option<WatermarkRequestConfig>,
+    /// Joint checkpoint (`--enable-joint-checkpoint`): decode budget ahead of
+    /// the consumer's watermark. `None` = no budget; the scheduler reads it.
+    #[serde(default)]
+    pub lookahead: Option<i64>,
 
     // Normalized internal fields.
     //
@@ -295,6 +299,7 @@ impl Default for SamplingParams {
             no_stop_trim: bool_false::default(),
             custom_params: None,
             watermark: None,
+            lookahead: None,
             stream_interval: None,
             logit_bias: None,
             sampling_seed: None,
@@ -439,6 +444,13 @@ impl SamplingParams {
         {
             return Err(bad(format!(
                 "beam_width must be at least 1, got {beam_width}."
+            )));
+        }
+        if let Some(lookahead) = self.lookahead
+            && lookahead < 0
+        {
+            return Err(bad(format!(
+                "lookahead must be non-negative, got {lookahead}."
             )));
         }
         if !self.temperature.is_finite() || self.temperature < 0.0 {
@@ -756,6 +768,7 @@ mod tests {
         "sampling_seed",
         "custom_params",
         "watermark",
+        "lookahead",
         "stop_strs",
         "stop_regex_strs",
         "stop_str_max_len",
@@ -836,6 +849,7 @@ mod tests {
         assert!(arr[at("logit_bias")].is_nil());
         assert!(arr[at("custom_params")].is_nil());
         assert!(arr[at("watermark")].is_nil());
+        assert!(arr[at("lookahead")].is_nil());
         // `normalize` outputs occupy the tail.
         assert!(arr[at("stop_strs")].is_array());
         assert_eq!(arr[at("is_normalized")].as_bool(), Some(false));
@@ -878,6 +892,7 @@ mod tests {
             (r#"{"n": 2}"#, "n must be 1"),
             (r#"{"beam_width": 2}"#, "beam_width must be 1"),
             (r#"{"beam_width": 0}"#, "beam_width must be at least 1"),
+            (r#"{"lookahead": -1}"#, "lookahead must be non-negative"),
         ] {
             let err = norm_err(json).to_string();
             assert!(
