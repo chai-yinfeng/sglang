@@ -179,6 +179,9 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     sampling_seed: Optional[int] = None
     custom_params: Optional[Dict[str, CustomParamValue]] = None
     watermark: Optional[WatermarkRequestConfig] = None
+    # Joint checkpoint (--enable-joint-checkpoint): decode budget ahead of the
+    # consumer's watermark (/watermark); None means no budget.
+    lookahead: Optional[int] = None
 
     # --- Internal fields (populated by __post_init__ or normalize(), not API-facing) ---
     stop_strs: Optional[Union[str, List[str]]] = None  # from stop
@@ -252,6 +255,8 @@ class SamplingParams(msgspec.Struct, kw_only=True, array_like=True):
     def verify(self, vocab_size):
         if self.beam_width is not None and self.beam_width < 1:
             raise ValueError(f"beam_width must be at least 1, got {self.beam_width}.")
+        if self.lookahead is not None and self.lookahead < 0:
+            raise ValueError(f"lookahead must be non-negative, got {self.lookahead}.")
         if not math.isfinite(self.temperature) or self.temperature < 0.0:
             raise ValueError(
                 f"temperature must be a non-negative finite number, got {self.temperature}."

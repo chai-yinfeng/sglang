@@ -56,6 +56,8 @@ from sglang.srt.managers.io_struct import (
     LoadLoRAAdapterReqOutput,
     LoRAUpdateOutput,
     OpenSessionReqInput,
+    PauseReqInput,
+    PauseReqOutput,
     PdRoleSwitchReqInput,
     PdRoleSwitchReqOutput,
     PinReqInput,
@@ -65,6 +67,8 @@ from sglang.srt.managers.io_struct import (
     ProfileReqType,
     ReleaseMemoryOccupationReqInput,
     ReleaseMemoryOccupationReqOutput,
+    ResumeReqInput,
+    ResumeReqOutput,
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
@@ -86,6 +90,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromIPCReqOutput,
     UpdateWeightsFromTensorReqInput,
     UpdateWeightsFromTensorReqOutput,
+    WatermarkReqInput,
+    WatermarkReqOutput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
 )
@@ -150,6 +156,9 @@ _COMMUNICATOR_SPECS = [
     ("scale_elastic_ep", ScaleElasticEPReqOutput),
     ("pin_request", PinReqOutput),
     ("unpin_request", UnpinReqOutput),
+    ("pause_request", PauseReqOutput),
+    ("resume_request", ResumeReqOutput),
+    ("watermark_request", WatermarkReqOutput),
 ]
 
 
@@ -933,6 +942,26 @@ class TokenizerControlMixin:
     ) -> UnpinReqOutput:
         self.auto_create_handle_loop()
         return (await self.unpin_request_communicator(obj))[0]
+
+    async def pause_request(
+        self: TokenizerManager, obj: PauseReqInput
+    ) -> PauseReqOutput:
+        """Joint checkpoint: take a running request out of decode, keeping its KV."""
+        self.auto_create_handle_loop()
+        return (await self.pause_request_communicator(obj))[0]
+
+    async def resume_request(
+        self: TokenizerManager, obj: ResumeReqInput
+    ) -> ResumeReqOutput:
+        self.auto_create_handle_loop()
+        return (await self.resume_request_communicator(obj))[0]
+
+    async def watermark_request(
+        self: TokenizerManager, obj: WatermarkReqInput
+    ) -> WatermarkReqOutput:
+        """Joint checkpoint: report the consumer's output watermark for a request."""
+        self.auto_create_handle_loop()
+        return (await self.watermark_request_communicator(obj))[0]
 
     async def pd_role_switch(
         self: TokenizerManager,

@@ -164,6 +164,8 @@ from sglang.srt.managers.io_struct import (
     MMInputsProcessError,
     OpenSessionReqInput,
     PauseGenerationReqInput,
+    PauseReqInput,
+    PauseReqOutput,
     PdRoleSwitchReqInput,
     PinReqInput,
     PinReqOutput,
@@ -172,6 +174,8 @@ from sglang.srt.managers.io_struct import (
     RemoveExternalCorpusReqInput,
     RemoveExternalCorpusReqOutput,
     ResumeMemoryOccupationReqInput,
+    ResumeReqInput,
+    ResumeReqOutput,
     RpcReqInput,
     RpcReqOutput,
     ScaleElasticEPReqInput,
@@ -194,6 +198,8 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromTensorReqInput,
     UpdateWeightVersionReqInput,
     UpdateWeightVersionReqOutput,
+    WatermarkReqInput,
+    WatermarkReqOutput,
     sock_send,
 )
 from sglang.srt.managers.load_snapshot import create_load_snapshot_writer
@@ -465,6 +471,10 @@ class Scheduler(
     # overrides init_load_publisher (which would otherwise not set it).
     _last_stall_publish_ts: float = float("-inf")
     kv_checksum_computer: Optional[KvChecksumComputer] = None
+    # Joint checkpoint flag; class-level default keeps the hot paths that test
+    # it (get_next_batch_to_run, is_fully_idle, abort_request) inert on a
+    # Scheduler built without __init__.
+    enable_joint_checkpoint: bool = False
 
     def __init__(
         self,
@@ -521,6 +531,11 @@ class Scheduler(
         # Joint checkpoint: rid -> extra tree lock taken by /pin_request. The
         # lock outlives the request; /unpin_request or flush_cache releases it.
         self.pin_table: Dict[str, TreeLock] = {}
+        # Joint checkpoint P5: rid -> request taken out of the decode batch by
+        # pause_request or its lookahead budget. Not in waiting_queue or
+        # running_batch; keeps its KV, tree lock and req_to_token row.
+        self.paused_reqs: Dict[str, Req] = {}
+        self.jc_pause_timeout_s = get_memory().jc_pause_timeout_s
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -1848,6 +1863,9 @@ class Scheduler(
                 (CloseSessionReqInput, self.close_session),
                 (PinReqInput, self.pin_request),
                 (UnpinReqInput, self.unpin_request),
+                (PauseReqInput, self.pause_request),
+                (ResumeReqInput, self.resume_request),
+                (WatermarkReqInput, self.watermark_request),
                 (
                     UpdateWeightFromDiskReqInput,
                     self.weight_updater.update_weights_from_disk,
@@ -3977,6 +3995,9 @@ class Scheduler(
         if running_batch.batch_size() < running_bs:
             running_batch.batch_is_full = False
 
+        if self.enable_joint_checkpoint:
+            running_batch = self._jc_pause_resume(running_batch)
+
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
         elif self._should_defer_prefill(running_batch):
@@ -5353,6 +5374,8 @@ class Scheduler(
         # Batch running status
         idle = (
             self.running_batch.is_empty()
+            # Joint checkpoint: paused requests hold KV.
+            and not (self.enable_joint_checkpoint and self.paused_reqs)
             and self.chunked_req is None
             and not self.dllm_manager.any_staging_reqs()
             and (self.last_batch is None or self.last_batch.is_empty())
@@ -5530,8 +5553,9 @@ class Scheduler(
         if self.is_fully_idle(ignore_waiting=self._engine_paused):
             self.cur_batch_for_debug = None
             self.last_batch = None
-            # Pinned nodes do not survive the reset; drop their locks with them.
-            self.pin_table.clear()
+            if self.enable_joint_checkpoint:
+                # Pinned nodes do not survive the reset; drop their locks with them.
+                self.pin_table.clear()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -5826,6 +5850,24 @@ class Scheduler(
                     )
                 else:
                     req.to_finish = FINISH_ABORT()
+
+        if self.enable_joint_checkpoint:
+            # Joint checkpoint: a paused request is in no batch. Mark it to
+            # finish; _jc_pause_resume puts it back next step so it takes the
+            # same one-decode-step abort path as a running request.
+            for req in self.paused_reqs.values():
+                if not req.finished() and (
+                    recv_req.abort_all or req.rid.startswith(recv_req.rid)
+                ):
+                    logger.debug(f"Abort paused request. {req.rid=}")
+                    if recv_req.discard:
+                        req.skip_radix_cache_insert = True
+                    if recv_req.abort_message:
+                        req.to_finish = FINISH_ABORT(
+                            recv_req.abort_message, HTTPStatus.SERVICE_UNAVAILABLE
+                        )
+                    else:
+                        req.to_finish = FINISH_ABORT()
 
     def _pause_engine(self) -> Tuple[List[Req], int]:
         raise NotImplementedError()
@@ -6174,7 +6216,9 @@ class Scheduler(
             self.session_controller.close(recv_req)
 
     def _find_inflight_req(self, rid: str) -> Optional[Req]:
-        """Exact-rid lookup among requests that hold KV (running or chunked)."""
+        """Exact-rid lookup among requests that hold KV (running, chunked or paused)."""
+        if (req := self.paused_reqs.get(rid)) is not None:
+            return req
         if (req := self.chunked_req) is not None and req.rid == rid:
             return req
         for req in self.collect_inflight_reqs():
@@ -6244,6 +6288,147 @@ class Scheduler(
         self.tree_cache.unlock(lock)
         logger.info(f"joint-checkpoint: unpinned rid={recv_req.rid}")
         return UnpinReqOutput(success=True)
+
+    def _jc_pause_resume(self, running_batch: ScheduleBatch) -> ScheduleBatch:
+        """Joint checkpoint P5, run once per scheduling step on the running
+        batch (after finished requests are filtered, before prefill admission):
+
+        1. take out the requests that want to pause (manual, or
+           len(output_ids) - watermark > lookahead) and park them in
+           self.paused_reqs with their KV, tree lock and req_to_token row;
+        2. mark requests paused longer than --jc-pause-timeout-s to finish
+           with an abort;
+        3. put back the requests that no longer want to pause (watermark
+           caught up, resumed, finishing) as a decode batch whose next input
+           is their last output token.
+
+        Overlap-safe: a request leaves or joins only here, between steps, so
+        an in-flight result still lands on a request that is in no batch.
+        """
+        if not self.spec_algorithm.is_none():
+            # Draft state is not carried across a pause; not supported.
+            return running_batch
+        now = time.monotonic()
+
+        to_pause = [req for req in running_batch.reqs if req.jc_wants_pause()]
+        if to_pause:
+            running_batch.filter_batch(reqs_to_exclude=to_pause)
+            running_batch.batch_is_full = False
+            for req in to_pause:
+                if req.jc_pause_reason is None:
+                    req.jc_pause_reason = "budget"
+                req.jc_paused_at = now
+                self.paused_reqs[req.rid] = req
+                logger.info(
+                    f"joint-checkpoint: paused rid={req.rid} "
+                    f"reason={req.jc_pause_reason} output_len={len(req.output_ids)} "
+                    f"watermark={req.jc_watermark} "
+                    f"lookahead={req.sampling_params.lookahead}"
+                )
+
+        # Under overlap the result in flight at pause time can finish the
+        # request (EOS / length); its KV was released there, so just drop it.
+        for rid in [rid for rid, req in self.paused_reqs.items() if req.finished()]:
+            del self.paused_reqs[rid]
+            logger.info(f"joint-checkpoint: paused rid={rid} finished in flight")
+
+        for req in self.paused_reqs.values():
+            if (
+                req.to_finish is None
+                and now - req.jc_paused_at > self.jc_pause_timeout_s
+            ):
+                logger.info(
+                    f"joint-checkpoint: pause timeout rid={req.rid} "
+                    f"after {now - req.jc_paused_at:.1f}s, aborting"
+                )
+                req.to_finish = FINISH_ABORT(
+                    f"Request paused for more than {self.jc_pause_timeout_s}s "
+                    f"(joint-checkpoint pause timeout)."
+                )
+
+        to_resume = [
+            req for req in self.paused_reqs.values() if not req.jc_wants_pause()
+        ]
+        if to_resume:
+            for req in to_resume:
+                del self.paused_reqs[req.rid]
+                logger.info(
+                    f"joint-checkpoint: resumed rid={req.rid} "
+                    f"reason={req.jc_pause_reason} output_len={len(req.output_ids)} "
+                    f"watermark={req.jc_watermark} "
+                    f"paused_for={now - req.jc_paused_at:.3f}s"
+                    + (" (finishing)" if req.to_finish is not None else "")
+                )
+                req.jc_pause_reason = None
+                req.jc_paused_at = None
+            # A decode batch from requests that already hold their KV; the
+            # last output token is relayed as the next input.
+            resume_batch = self._build_hisparse_decode_batch(to_resume)
+            if running_batch.is_empty():
+                running_batch = resume_batch
+            else:
+                running_batch.merge_batch(resume_batch)
+            running_batch.batch_is_full = False
+        return running_batch
+
+    def _jc_control_req(self, rid: str):
+        """(req, error) for the P5 control messages."""
+        if not self.enable_joint_checkpoint:
+            return None, "--enable-joint-checkpoint is not set"
+        if not self.spec_algorithm.is_none():
+            return None, "pause/resume is not supported with speculative decoding"
+        req = self._find_inflight_req(rid)
+        if req is None or req.finished() or not req.kv.holds_kv:
+            return None, f"request {rid} is not running"
+        if req.to_finish is not None:
+            return None, f"request {rid} is finishing"
+        return req, ""
+
+    def pause_request(self, recv_req: PauseReqInput):
+        """Joint checkpoint P5: the request sits out decode from the next
+        scheduling step until resume_request (the budget cannot resume it)."""
+        req, err = self._jc_control_req(recv_req.rid)
+        if req is None:
+            return PauseReqOutput(success=False, message=err)
+        req.jc_pause_reason = "manual"
+        return PauseReqOutput(
+            success=True,
+            output_len=len(req.output_ids),
+            paused=req.rid in self.paused_reqs,
+        )
+
+    def resume_request(self, recv_req: ResumeReqInput):
+        """Joint checkpoint P5: clear the pause; the request rejoins the decode
+        batch at the next scheduling step unless its lookahead budget is still
+        exceeded (then the watermark has to move first)."""
+        req, err = self._jc_control_req(recv_req.rid)
+        if req is None:
+            return ResumeReqOutput(success=False, message=err)
+        # Clears a manual pause; a budget pause only lifts with the watermark.
+        over = req.jc_over_budget()
+        req.jc_pause_reason = "budget" if over else None
+        message = "still over the lookahead budget" if over else ""
+        return ResumeReqOutput(
+            success=True,
+            output_len=len(req.output_ids),
+            paused=req.rid in self.paused_reqs,
+            message=message,
+        )
+
+    def watermark_request(self, recv_req: WatermarkReqInput):
+        """Joint checkpoint P5: the consumer has read ``watermark`` output
+        tokens. Monotonic and clamped to the output length."""
+        req, err = self._jc_control_req(recv_req.rid)
+        if req is None:
+            return WatermarkReqOutput(success=False, message=err)
+        req.jc_watermark = max(
+            req.jc_watermark, min(int(recv_req.watermark), len(req.output_ids))
+        )
+        return WatermarkReqOutput(
+            success=True,
+            output_len=len(req.output_ids),
+            paused=req.rid in self.paused_reqs,
+        )
 
     def maybe_sleep_on_idle(self):
         if self.idle_sleeper is not None:

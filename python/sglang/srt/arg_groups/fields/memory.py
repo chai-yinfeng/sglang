@@ -95,6 +95,10 @@ class Memory(msgspec.Struct):
         bool,
         "Enable the joint-checkpoint control primitives on the radix cache: /pin_request and /unpin_request hold a running request's KV prefix in the tree independent of the request's lifetime, and /abort_request accepts discard=true to release a request's KV without inserting it into the tree.",
     ] = False
+    jc_pause_timeout_s: A[
+        float,
+        "Joint checkpoint: a request paused by /pause_request or by its lookahead budget for longer than this many seconds is aborted (finish_reason abort, pause timeout). Only used with --enable-joint-checkpoint.",
+    ] = 300.0
 
     # -------------------------------------------------------------------------
     # Hierarchical cache

@@ -149,11 +149,13 @@ from sglang.srt.managers.io_struct import (
     OpenSessionReqInput,
     ParseFunctionCallReq,
     PauseGenerationReqInput,
+    PauseReqInput,
     PdRoleSwitchReqInput,
     PinReqInput,
     ProfileReq,
     ReleaseMemoryOccupationReqInput,
     ResumeMemoryOccupationReqInput,
+    ResumeReqInput,
     SendWeightsToRemoteInstanceReqInput,
     SeparateReasoningReqInput,
     SetInternalStateReq,
@@ -164,6 +166,7 @@ from sglang.srt.managers.io_struct import (
     UpdateWeightsFromDistributedReqInput,
     UpdateWeightsFromIPCReqInput,
     UpdateWeightsFromTensorReqInput,
+    WatermarkReqInput,
     UpdateWeightVersionReqInput,
     VertexGenerateReqInput,
 )
@@ -1748,6 +1751,38 @@ async def pin_request(obj: Annotated[PinReqInput, Body()], request: Request):
 async def unpin_request(obj: Annotated[UnpinReqInput, Body()], request: Request):
     """Joint checkpoint: release the hold taken by /pin_request for this rid."""
     result = await _global_state.tokenizer_manager.unpin_request(obj)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.post("/pause_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def pause_request(obj: Annotated[PauseReqInput, Body()], request: Request):
+    """Joint checkpoint: stop decoding this request at the next scheduling step
+    but keep its KV and state; /resume_request continues it (needs
+    --enable-joint-checkpoint)."""
+    result = await _global_state.tokenizer_manager.pause_request(obj)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.post("/resume_request")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def resume_request(obj: Annotated[ResumeReqInput, Body()], request: Request):
+    """Joint checkpoint: put a paused request back into the decode batch."""
+    result = await _global_state.tokenizer_manager.resume_request(obj)
+    status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
+    return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
+
+
+@app.post("/watermark")
+@auth_level(AuthLevel.ADMIN_OPTIONAL)
+async def watermark_request(
+    obj: Annotated[WatermarkReqInput, Body()], request: Request
+):
+    """Joint checkpoint: report how many output tokens of this request the
+    consumer has read; drives the lookahead pause/resume budget."""
+    result = await _global_state.tokenizer_manager.watermark_request(obj)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)
 

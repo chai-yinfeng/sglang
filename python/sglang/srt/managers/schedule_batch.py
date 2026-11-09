@@ -1192,6 +1192,14 @@ class Req(ReqDllmMixin):
         self.vocab_size = vocab_size
         self.priority = priority
 
+        # Joint checkpoint (--enable-joint-checkpoint) P5 pause / resume.
+        # Output tokens the consumer has read (/watermark), the reason the
+        # request is (to be) paused: None / "manual" / "budget", and the
+        # monotonic time it left the decode batch.
+        self.jc_watermark: int = 0
+        self.jc_pause_reason: Optional[str] = None
+        self.jc_paused_at: Optional[float] = None
+
         # For incremental decoding
         # ----- | --------- read_ids -------|
         # ----- |   surr_ids  |
@@ -1661,6 +1669,22 @@ class Req(ReqDllmMixin):
     def next_output_finishes_by_length(self) -> bool:
         # Whether committing one more output token reaches max_new_tokens
         return len(self.output_ids) + 1 >= self.sampling_params.max_new_tokens
+
+    def jc_over_budget(self) -> bool:
+        """Joint checkpoint: generated further than lookahead past the watermark."""
+        lookahead = self.sampling_params.lookahead
+        return (
+            lookahead is not None
+            and len(self.output_ids) - self.jc_watermark > lookahead
+        )
+
+    def jc_wants_pause(self) -> bool:
+        """Joint checkpoint: should sit out the next decode step. A request that
+        is finishing must run, and one without an output token yet has nothing
+        to resume from, so neither pauses."""
+        if self.to_finish is not None or not self.output_ids:
+            return False
+        return self.jc_pause_reason == "manual" or self.jc_over_budget()
 
     @property
     def extend_len(self) -> int:

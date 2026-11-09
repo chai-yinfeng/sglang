@@ -2453,6 +2453,47 @@ class UnpinReqOutput(BaseReq, kw_only=True):
     message: str = ""
 
 
+class PauseReqInput(BaseReq, kw_only=True):
+    """Joint checkpoint P5: take the running request ``rid`` out of the decode
+    batch at the next scheduling step, keeping its KV, tree lock and
+    req_to_token row. ``ResumeReqInput`` puts it back."""
+
+
+class PauseReqOutput(BaseReq, kw_only=True):
+    success: bool
+    # Output tokens generated so far / whether the request is already out of the batch.
+    output_len: int = 0
+    paused: bool = False
+    message: str = ""
+
+
+class ResumeReqInput(BaseReq, kw_only=True):
+    pass
+
+
+class ResumeReqOutput(BaseReq, kw_only=True):
+    success: bool
+    output_len: int = 0
+    paused: bool = False
+    message: str = ""
+
+
+class WatermarkReqInput(BaseReq, kw_only=True):
+    """Joint checkpoint P5: the consumer has read ``watermark`` output tokens of
+    request ``rid``. With sampling_params.lookahead set, the scheduler pauses
+    the request while ``output_len - watermark > lookahead`` and resumes it
+    once a later watermark brings it back within budget."""
+
+    watermark: int
+
+
+class WatermarkReqOutput(BaseReq, kw_only=True):
+    success: bool
+    output_len: int = 0
+    paused: bool = False
+    message: str = ""
+
+
 class OpenSessionReqInput(BaseReq, kw_only=True):
     capacity_of_str_len: int
     session_id: Optional[str] = None

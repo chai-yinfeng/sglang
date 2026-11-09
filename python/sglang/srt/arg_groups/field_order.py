@@ -553,5 +553,6 @@ POSITIONAL_FIELD_ORDER = (
     "aux_hidden_state_capture",
     "return_aux_hidden_state_layer_ids",
     "enable_joint_checkpoint",
+    "jc_pause_timeout_s",
 )
 # fmt: on
