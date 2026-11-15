@@ -16,13 +16,18 @@ over fake pools, and real Req objects.
   back and frees it (StreamingSession.try_cache_finished_req unchanged).
 - Overlap: a late result for the truncated request streams nothing more and
   frees nothing more.
+- Admission (TestJointCheckpointAdmitFirstExclusive, pass-through
+  PrefillAdder): successors within --jc-admit-first-max-tokens get a prefill
+  batch of their own, without cold requests or the chunked request's next
+  chunk, at most JC_ADMIT_FIRST_MAX_CONSECUTIVE times in a row; flag off is
+  admission as without the mark.
 """
 
 import unittest
 from array import array
 from collections import deque
 from types import SimpleNamespace
-from unittest.mock import MagicMock
+from unittest.mock import MagicMock, patch
 
 import torch
 
@@ -34,6 +39,7 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
+from sglang.srt.managers.schedule_policy import AddReqResult
 from sglang.srt.managers.scheduler import Scheduler
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
@@ -45,7 +51,12 @@ from sglang.srt.mem_cache.base_prefix_cache import (
     TreeLock,
 )
 from sglang.srt.mem_cache.common import release_kv_cache
-from sglang.srt.runtime_context import get_parallel, publish, reset_context
+from sglang.srt.runtime_context import (
+    get_context,
+    get_parallel,
+    publish,
+    reset_context,
+)
 from sglang.srt.sampling.sampling_params import SamplingParams
 from sglang.srt.server_args import ServerArgs
 from sglang.srt.session.session_controller import Session
@@ -638,6 +649,323 @@ class TestJointCheckpointTruncate(CustomTestCase):
             self.cache.token_to_kv_pool_allocator.freed_positions(), freed_before
         )
         self.assertEqual(self.cache.req_to_token_pool.free_slots, [])
+
+    # ------------------------------------------------------------ admit-first estimate
+
+    def test_appended_tokens_estimate_matches_prefill_extend(self):
+        pos = len(PROMPT) + 2
+        s, old, new = self.successor_after_cut(pos, append=(7, 8, 9))
+        self.assertEqual(s._jc_appended_tokens(new), 3)
+        new.init_next_round_input(self.cache)
+        self.assertEqual(len(new.full_untruncated_fill_ids) - new.prefix_len, 3)
+        # Without a held slot the whole prompt counts.
+        self.cache.session.slots.clear()
+        self.assertEqual(s._jc_appended_tokens(new), len(new.origin_input_ids))
+
+
+# ---------------------------------------------------------------- exclusive admission
+
+NUM_ROWS = 16
+CHUNK = 8192
+
+
+class _AdmReq:
+    """The fields _get_new_batch_prefill_raw and the admit-first hooks read."""
+
+    def __init__(self, rid, n_input=6000, admit_first=False, session_id=None):
+        self.rid = rid
+        self.origin_input_ids = array("q", range(n_input))
+        self.jc_admit_first = admit_first
+        self.session = (
+            SimpleNamespace(session_id=session_id) if session_id is not None else None
+        )
+        self.kv = SimpleNamespace(holds_kv=False)
+        self.beam_group = None
+        self.token_indices_to_pool = None
+        self.inflight_middle_chunks = 0
+        self.next_round_inits = 0
+
+    def init_next_round_input(self, tree_cache=None):
+        self.next_round_inits += 1
+
+    def __repr__(self):
+        return self.rid
+
+
+class _Adder:
+    """Admits everything offered: the continuing chunk first, then waiting
+    requests in order. Records the chunk size it was built with."""
+
+    def __init__(self, *args, **kwargs):
+        self.chunked_prefill_size = args[6]
+        self.can_run_list = []
+        self.preempt_list = []
+        self.new_chunked_req = None
+        self.rem_chunk_tokens = self.chunked_prefill_size
+
+    def add_chunked_req(self, req):
+        self.can_run_list.append(req)
+        return req  # still chunked after this round
+
+    def budget_state(self):
+        return AddReqResult.CONTINUE
+
+    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+        self.can_run_list.append(req)
+        return AddReqResult.CONTINUE
+
+
+class _BatchBuilt(Exception):
+    pass
+
+
+class TestJointCheckpointAdmitFirstExclusive(CustomTestCase):
+    """_get_new_batch_prefill_raw with a pass-through PrefillAdder: which
+    requests reach ScheduleBatch.init_new, and whether the chunked request is
+    part of the batch."""
+
+    def setUp(self):
+        super().setUp()
+        publish(ServerArgs(model_path="dummy"), role="test")
+        self.addCleanup(reset_context)
+        self.slots = {}
+
+    def make_scheduler(self, waiting, chunked=None, enable=True) -> Scheduler:
+        s = Scheduler.__new__(Scheduler)
+        s.enable_joint_checkpoint = enable
+        s.jc_admit_first_max_tokens = 512
+        s._jc_admit_first_streak = 0
+        s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        s.enable_priority_preemption = False
+        s.is_hybrid_swa = False
+        s.waiting_queue = list(waiting)
+        s.chunked_req = chunked
+        s.min_free_slots_delayer = None
+        s.policy = MagicMock()
+        s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.processed_tokens_counter = 0
+        s.chunked_prefill_size = CHUNK
+        s.dynamic_chunk_sizer = None
+        s.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
+        )
+        s.get_prefill_adder_class = lambda: _Adder
+        s.page_size = 1
+        s.tree_cache = SimpleNamespace(
+            buffer_pipeline=None,
+            storage_prefetch_retries=None,
+            session=SimpleNamespace(slots=self.slots),
+        )
+        s.token_to_kv_pool_allocator = None
+        s.new_token_ratio_tracker = SimpleNamespace(current=0.0)
+        s.max_prefill_tokens = 1 << 20
+        s.is_mixed_chunk = False
+        s.priority_scheduling_preemption_threshold = 0
+        s.max_prefill_bs = 0
+        s.max_running_requests = NUM_ROWS
+        s.dllm_config = None
+        s.enable_lora = False
+        s.disaggregation_mode = DisaggregationMode.NULL
+        s.enable_hicache_storage = False
+        s.enable_lmcache = False
+        s.truncation_align_size = None
+        s.model_config = None
+        s.enable_overlap = False
+        s.spec_algorithm = None
+        s.req_to_token_pool = SimpleNamespace(available_size=lambda: NUM_ROWS // 2)
+        s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        return s
+
+    def successor(self, rid, appended=16, held=4000):
+        self.slots[rid] = SimpleNamespace(
+            kv=SimpleNamespace(kv_committed_len=held, holds_kv=True)
+        )
+        return _AdmReq(rid, n_input=held + appended, admit_first=True, session_id=rid)
+
+    def admit(self, s, running_batch=None):
+        """One admission round: (admitted reqs, init_new's chunked_req, adder
+        chunk size), or None when nothing was admitted."""
+        running_batch = running_batch or ScheduleBatch(reqs=[])
+        built = {}
+        real_adder = s.get_prefill_adder_class()
+
+        def make_adder(*args, **kwargs):
+            built["adder"] = real_adder(*args, **kwargs)
+            return built["adder"]
+
+        s.get_prefill_adder_class = lambda: make_adder
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list), kwargs.get("chunked_req"))
+
+        try:
+            with (
+                get_context().override_server_args(pp_max_micro_batch_size=NUM_ROWS),
+                patch.object(ScheduleBatch, "init_new", side_effect=capture),
+                patch("sglang.srt.managers.scheduler.set_time_batch"),
+            ):
+                try:
+                    s._get_new_batch_prefill_raw(
+                        prefill_delayer_single_pass=None,
+                        running_batch=running_batch,
+                    )
+                except _BatchBuilt as e:
+                    reqs, chunked_kw = e.args
+                    return reqs, chunked_kw, built["adder"].chunked_prefill_size
+                return None
+        finally:
+            s.get_prefill_adder_class = lambda: real_adder
+
+    # ------------------------------------------------------------ exclusive batch
+
+    def test_successor_admitted_alone_among_cold_requests(self):
+        cold = [_AdmReq(f"c{i}") for i in range(3)]
+        succ = self.successor("s1")
+        s = self.make_scheduler([cold[0], cold[1], succ, cold[2]])
+        reqs, chunked_kw, chunk_size = self.admit(s)
+        self.assertEqual(reqs, [succ])
+        self.assertIsNone(chunked_kw)
+        # No chunking in the exclusive step: a successor cannot become chunked.
+        self.assertIsNone(chunk_size)
+        self.assertEqual(s.waiting_queue, cold)
+        for req in cold:
+            self.assertEqual(req.next_round_inits, 0)
+
+        # The next round is normal again.
+        reqs, _, chunk_size = self.admit(s)
+        self.assertEqual(reqs, cold)
+        self.assertEqual(chunk_size, CHUNK)
+        self.assertEqual(s._jc_admit_first_streak, 0)
+
+    def test_several_successors_share_the_exclusive_batch(self):
+        cold = _AdmReq("c0")
+        a, b = self.successor("a", appended=100), self.successor("b", appended=200)
+        s = self.make_scheduler([cold, a, b])
+        reqs, _, _ = self.admit(s)
+        self.assertEqual(reqs, [a, b])
+        self.assertEqual(s.waiting_queue, [cold])
+
+    def test_chunked_req_sits_out_the_exclusive_round(self):
+        chunk = _AdmReq("chunk", n_input=24000)
+        cold = _AdmReq("c0")
+        succ = self.successor("s1")
+        s = self.make_scheduler([cold, succ], chunked=chunk)
+        reqs, chunked_kw, _ = self.admit(s)
+        self.assertEqual(reqs, [succ])
+        self.assertIsNone(chunked_kw)
+        # Untouched: no next-round setup, no in-flight middle chunk counted.
+        self.assertIs(s.chunked_req, chunk)
+        self.assertEqual(chunk.next_round_inits, 0)
+        self.assertEqual(chunk.inflight_middle_chunks, 0)
+
+        # Next round: the chunk continues first, as without the successor.
+        reqs, chunked_kw, chunk_size = self.admit(s)
+        self.assertEqual(reqs, [chunk, cold])
+        self.assertIs(chunked_kw, chunk)
+        self.assertEqual(chunk_size, CHUNK)
+        self.assertEqual(chunk.next_round_inits, 1)
+        self.assertEqual(chunk.inflight_middle_chunks, 1)
+
+    def test_full_running_batch_keeps_normal_admission(self):
+        chunk = _AdmReq("chunk", n_input=24000)
+        succ = self.successor("s1")
+        s = self.make_scheduler([succ], chunked=chunk)
+        running = ScheduleBatch(reqs=[_AdmReq("r0")])
+        running.batch_is_full = True
+        reqs, chunked_kw, _ = self.admit(s, running)
+        # The chunk proceeds; the full batch stops waiting admission.
+        self.assertEqual(reqs, [chunk])
+        self.assertIs(chunked_kw, chunk)
+        self.assertEqual(s.waiting_queue, [succ])
+
+    # ------------------------------------------------------------ bounds
+
+    def test_oversized_successor_only_keeps_head_of_queue(self):
+        chunk = _AdmReq("chunk", n_input=24000)
+        cold = _AdmReq("c0")
+        big = self.successor("big", appended=600)
+        s = self.make_scheduler([cold, big], chunked=chunk)
+        reqs, chunked_kw, chunk_size = self.admit(s)
+        self.assertEqual(reqs, [chunk, big, cold])
+        self.assertIs(chunked_kw, chunk)
+        self.assertEqual(chunk_size, CHUNK)
+
+    def test_budget_takes_successors_from_the_head_until_full(self):
+        cold = _AdmReq("c0")
+        a = self.successor("a", appended=300)
+        b = self.successor("b", appended=300)
+        s = self.make_scheduler([cold, a, b])
+        reqs, _, _ = self.admit(s)
+        self.assertEqual(reqs, [a])
+        # b waits for the next round, still ahead of the cold request.
+        self.assertEqual(s.waiting_queue, [b, cold])
+
+    def test_nonpositive_budget_disables_exclusive_step(self):
+        cold = _AdmReq("c0")
+        succ = self.successor("s1")
+        s = self.make_scheduler([cold, succ])
+        s.jc_admit_first_max_tokens = 0
+        reqs, _, chunk_size = self.admit(s)
+        self.assertEqual(reqs, [succ, cold])
+        self.assertEqual(chunk_size, CHUNK)
+
+    def test_consecutive_exclusive_steps_are_capped(self):
+        chunk = _AdmReq("chunk", n_input=100000)
+        cold = _AdmReq("c0")
+        s = self.make_scheduler([cold], chunked=chunk)
+        cap = Scheduler.JC_ADMIT_FIRST_MAX_CONSECUTIVE
+        for i in range(cap):
+            succ = self.successor(f"s{i}")
+            s.waiting_queue.append(succ)
+            reqs, chunked_kw, _ = self.admit(s)
+            self.assertEqual(reqs, [succ], f"round {i}")
+            self.assertIsNone(chunked_kw)
+        # One more successor arrives, but a normal round is due.
+        late = self.successor("late")
+        s.waiting_queue.append(late)
+        reqs, chunked_kw, _ = self.admit(s)
+        self.assertEqual(reqs, [chunk, late, cold])
+        self.assertIs(chunked_kw, chunk)
+        self.assertEqual(s._jc_admit_first_streak, 0)
+        # The streak starts over.
+        again = self.successor("again")
+        s.waiting_queue = [_AdmReq("c1"), again]
+        reqs, _, _ = self.admit(s)
+        self.assertEqual(reqs, [again])
+
+    def test_not_on_disaggregated_prefill(self):
+        cold = _AdmReq("c0")
+        succ = self.successor("s1")
+        s = self.make_scheduler([cold, succ])
+        s.disaggregation_mode = DisaggregationMode.PREFILL
+        reqs, _, _ = self.admit(s)
+        self.assertEqual(reqs, [succ, cold])
+
+    # ------------------------------------------------------------ flag off
+
+    def test_flag_off_admits_like_unmarked_requests(self):
+        def run(enable, marked):
+            self.slots.clear()
+            chunk = _AdmReq("chunk", n_input=24000)
+            cold = [_AdmReq(f"c{i}") for i in range(2)]
+            succ = self.successor("s1")
+            succ.jc_admit_first = marked
+            s = self.make_scheduler(
+                [cold[0], succ, cold[1]], chunked=chunk, enable=enable
+            )
+            reqs, chunked_kw, chunk_size = self.admit(s)
+            return (
+                [r.rid for r in reqs],
+                chunked_kw.rid,
+                chunk_size,
+                chunk.inflight_middle_chunks,
+                [r.rid for r in s.waiting_queue],
+            )
+
+        baseline = run(enable=False, marked=False)
+        self.assertEqual(baseline, (["chunk", "c0", "s1", "c1"], "chunk", CHUNK, 1, []))
+        self.assertEqual(run(enable=False, marked=True), baseline)
+        self.assertEqual(run(enable=True, marked=False), baseline)
 
 
 if __name__ == "__main__":

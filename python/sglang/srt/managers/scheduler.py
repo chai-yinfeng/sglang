@@ -489,6 +489,9 @@ class Scheduler(
     # it (get_next_batch_to_run, is_fully_idle, abort_request) inert on a
     # Scheduler built without __init__.
     enable_joint_checkpoint: bool = False
+    # Joint checkpoint P3: exclusive admit-first prefill steps allowed in a
+    # row before one normal admission round (see _jc_admit_first_exclusive).
+    JC_ADMIT_FIRST_MAX_CONSECUTIVE: int = 4
 
     def __init__(
         self,
@@ -553,6 +556,8 @@ class Scheduler(
         # running_batch; keeps its KV, tree lock and req_to_token row.
         self.paused_reqs: Dict[str, Req] = {}
         self.jc_pause_timeout_s = get_memory().jc_pause_timeout_s
+        self.jc_admit_first_max_tokens = get_memory().jc_admit_first_max_tokens
+        self._jc_admit_first_streak = 0
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -4204,8 +4209,11 @@ class Scheduler(
             running_batch,
             processed_tokens=self.processed_tokens_counter,
         )
+        # Joint checkpoint P3: the truncate successors admitted alone this step.
+        jc_exclusive: Optional[List[Req]] = None
         if self.enable_joint_checkpoint:
             self._jc_front_waiting_queue()
+            jc_exclusive = self._jc_admit_first_exclusive(running_batch)
 
         if TEST_RETRACT and running_bs > TEST_RETRACT_NO_PREFILL_BS:
             # If we are testing retraction and the running batch size exceeds
@@ -4220,6 +4228,10 @@ class Scheduler(
             dynamic_size = self.dynamic_chunk_sizer.predict(history_len)
             if dynamic_size is not None:
                 chunked_prefill_size = dynamic_size
+        if jc_exclusive is not None:
+            # Whole successors only (each fits the small admit-first budget):
+            # without a chunk size none of them can become a second chunked_req.
+            chunked_prefill_size = None
 
         # Prefill policy
         # Get BLOCK_M from the backend for tile-budget admission logic
@@ -4248,7 +4260,9 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
-        if self.chunked_req is not None:
+        # An exclusive step leaves the chunked request out for one round; see
+        # _jc_admit_first_exclusive.
+        if self.chunked_req is not None and jc_exclusive is None:
             self.chunked_req.init_next_round_input()
             adder.chunked_req_limit = self.policy.shortest_prefill_chunk_limit(
                 self.chunked_req,
@@ -4276,7 +4290,7 @@ class Scheduler(
             mamba_allocator.alloc_group_begin(len(self.waiting_queue))
         buffer_pipeline = self.tree_cache.buffer_pipeline
         # Get requests from the waiting queue to a new prefill batch
-        for req in self.waiting_queue:
+        for req in self.waiting_queue if jc_exclusive is None else jc_exclusive:
             # A spent pass budget admits no one, even before the first
             # candidate: the resumed chunk or mixed decode rows can spend it.
             if adder.budget_state() == AddReqResult.OTHER:
@@ -4401,8 +4415,10 @@ class Scheduler(
             assert self.chunked_req is None
             self.chunked_req = adder.new_chunked_req
 
-        if self.chunked_req is not None:
-            self.chunked_req.inflight_middle_chunks += 1
+        # The chunked request is not in an exclusive batch.
+        batch_chunked_req = self.chunked_req if jc_exclusive is None else None
+        if batch_chunked_req is not None:
+            batch_chunked_req.inflight_middle_chunks += 1
 
         set_time_batch(can_run_list, "set_forward_entry_time")
 
@@ -4415,11 +4431,11 @@ class Scheduler(
             self.model_config,
             self.enable_overlap,
             self.spec_algorithm,
-            chunked_req=self.chunked_req,
+            chunked_req=batch_chunked_req,
         )
 
         new_batch.contains_last_prefill_chunk = (
-            self.chunked_req is None or len(can_run_list) != 1
+            batch_chunked_req is None or len(can_run_list) != 1
         )
         new_batch.hisparse_coordinator = self.hisparse_coordinator
 
@@ -6418,6 +6434,83 @@ class Scheduler(
         first = [req for req in self.waiting_queue if req.jc_admit_first]
         rest = [req for req in self.waiting_queue if not req.jc_admit_first]
         self.waiting_queue[:] = first + rest
+
+    def _jc_admit_first_exclusive(
+        self, running_batch: ScheduleBatch
+    ) -> Optional[List[Req]]:
+        """Joint checkpoint P3: the truncate successors (jc_admit_first, at
+        the head of the waiting queue after _jc_front_waiting_queue) to admit
+        as a prefill batch of their own this step, or None for normal
+        admission. A successor's prefix is held by its session slot, so the
+        batch is a few appended tokens and its step is short; sharing a
+        batch with cold prompts or the next chunked-prefill chunk would make
+        it as long as theirs.
+
+        The exclusive batch holds no other waiting request and no chunk of
+        self.chunked_req, which sits this round out unchanged: the chunk run
+        last step was already published by stash_chunked_request at the top
+        of get_next_batch_to_run (prefix_len == extend_end, so the next round
+        neither stashes it again nor needs its result first), and nothing
+        here touches its row, KV, lock or inflight_middle_chunks. Under
+        overlap that chunk's result is processed during this step as usual.
+
+        Bounds, so the exclusive step cannot hold normal prefill back:
+        - successors are taken from the queue head while their appended
+          tokens sum to at most --jc-admit-first-max-tokens (<= 0 disables);
+          the rest, and an oversized first one, keep only their head-of-queue
+          place under normal admission;
+        - at most JC_ADMIT_FIRST_MAX_CONSECUTIVE exclusive steps in a row,
+          then one normal admission round (chunk included) runs.
+        Only on the plain path (no PP, disaggregation or dLLM, whose chunked
+        prefill has its own bookkeeping), and not while the running batch is
+        full or has no free request slot (the step would admit nothing).
+        """
+        picked: List[Req] = []
+        if (
+            self.jc_admit_first_max_tokens > 0
+            and self._jc_admit_first_streak < self.JC_ADMIT_FIRST_MAX_CONSECUTIVE
+            and self.waiting_queue
+            and self.waiting_queue[0].jc_admit_first
+            and self.dllm_config is None
+            and self.disaggregation_mode == DisaggregationMode.NULL
+            and get_parallel().pp_size == 1
+            and not running_batch.batch_is_full
+            and self.get_num_allocatable_reqs(
+                len(running_batch.reqs), running_batch=running_batch
+            )
+            > 0
+        ):
+            total = 0
+            for req in self.waiting_queue:
+                if not req.jc_admit_first:
+                    break
+                total += self._jc_appended_tokens(req)
+                if total > self.jc_admit_first_max_tokens:
+                    break
+                picked.append(req)
+        if not picked:
+            self._jc_admit_first_streak = 0
+            return None
+        self._jc_admit_first_streak += 1
+        logger.debug(
+            f"joint-checkpoint: exclusive admit-first prefill "
+            f"rids={[req.rid for req in picked]} tokens<={total} "
+            f"skipping_chunked_req={self.chunked_req is not None} "
+            f"streak={self._jc_admit_first_streak}"
+        )
+        return picked
+
+    def _jc_appended_tokens(self, req: Req) -> int:
+        """Prefill tokens a successor needs before its prefix match: its
+        prompt past the KV its streaming-session slot holds (the match may
+        round that down to a page boundary). The whole prompt without a
+        slot, which keeps such a request out of the exclusive step."""
+        slots = getattr(getattr(self.tree_cache, "session", None), "slots", None)
+        slot = None
+        if slots is not None and req.session is not None:
+            slot = slots.get(req.session.session_id)
+        held = slot.kv.kv_committed_len if slot is not None and slot.kv.holds_kv else 0
+        return max(len(req.origin_input_ids) - held, 0)
 
     def pin_request(self, recv_req: PinReqInput):
         """Joint checkpoint P1: insert the running request's KV prefix

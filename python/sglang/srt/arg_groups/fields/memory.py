@@ -107,6 +107,10 @@ class Memory(msgspec.Struct):
         float,
         "Joint checkpoint: /pin_request is refused when the pinned tokens (sum over holds, shared prefixes counted once per hold) would exceed this fraction of the KV pool. <= 0 disables the cap. Only used with --enable-joint-checkpoint.",
     ] = 0.5
+    jc_admit_first_max_tokens: A[
+        int,
+        "Joint checkpoint: the successors of truncated streaming turns get a prefill step of their own (no other waiting request and no chunked-prefill chunk in it) while their appended tokens total at most this many; a larger successor only goes to the head of the waiting queue. <= 0 disables the exclusive step. Only used with --enable-joint-checkpoint.",
+    ] = 512
 
     # -------------------------------------------------------------------------
     # Hierarchical cache

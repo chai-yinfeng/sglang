@@ -556,5 +556,6 @@ POSITIONAL_FIELD_ORDER = (
     "jc_pause_timeout_s",
     "jc_pin_ttl_s",
     "jc_pin_max_ratio",
+    "jc_admit_first_max_tokens",
 )
 # fmt: on
