@@ -93,7 +93,7 @@ class Memory(msgspec.Struct):
     ] = None
     enable_joint_checkpoint: A[
         bool,
-        "Enable the joint-checkpoint control primitives on the radix cache: /pin_request and /unpin_request hold a running request's KV prefix in the tree independent of the request's lifetime, /abort_request accepts discard=true to release a request's KV without inserting it into the tree, and a streaming-session /generate with session_params.truncate_to cuts the session's in-flight request at that position and continues from it in the same scheduling step.",
+        "Enable the joint-checkpoint control primitives on the radix cache: /pin_request and /unpin_request hold a running request's KV prefix in the tree independent of the request's lifetime, /abort_request accepts discard=true to release a request's KV without inserting it into the tree, and a /generate carrying truncate={rid, pos} cuts request rid at absolute position pos, keeping its KV prefix in the tree, and continues from there ahead of the waiting queue.",
     ] = False
     jc_pause_timeout_s: A[
         float,
@@ -109,7 +109,7 @@ class Memory(msgspec.Struct):
     ] = 0.5
     jc_admit_first_max_tokens: A[
         int,
-        "Joint checkpoint: the successors of truncated streaming turns get a prefill step of their own (no other waiting request and no chunked-prefill chunk in it) while their appended tokens total at most this many; a larger successor only goes to the head of the waiting queue. <= 0 disables the exclusive step. Only used with --enable-joint-checkpoint.",
+        "Joint checkpoint: the successors of truncated requests get a prefill step of their own (no other waiting request and no chunked-prefill chunk in it) while their appended tokens total at most this many; a larger successor only goes to the head of the waiting queue. <= 0 disables the exclusive step. Only used with --enable-joint-checkpoint.",
     ] = 512
 
     # -------------------------------------------------------------------------

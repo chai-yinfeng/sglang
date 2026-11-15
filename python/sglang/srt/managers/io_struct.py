@@ -154,15 +154,23 @@ class SessionParams(msgspec.Struct, kw_only=True, array_like=True):
     # from the accumulated context so the new turn sees only the original input.
     # Not supported in streaming sessions.
     drop_previous_output: Optional[bool] = None
-    # Joint checkpoint P3 (--enable-joint-checkpoint, streaming sessions only):
-    # absolute token position (index into the in-flight turn's
-    # ``input_ids + output_ids``, ``>= len(input_ids)``) to truncate the
-    # session's in-flight request to. The scheduler finishes that request at
-    # the next step boundary (finish_reason abort, message starting with
-    # "Truncated"), keeps its KV [0, truncate_to) in the session slot, and
-    # admits this request -- whose ``input_ids`` are the tokens to append
-    # after the cut -- ahead of the waiting queue in the same step.
-    truncate_to: Optional[int] = None
+
+
+class TruncateParams(msgspec.Struct, kw_only=True, array_like=True):
+    """Joint checkpoint P3 (--enable-joint-checkpoint): continue request
+    ``rid`` from absolute position ``pos`` (an index into its
+    ``input_ids + output_ids``). The carrying request's ``input_ids`` are its
+    whole input: that request's first ``pos`` tokens, then the appended ones.
+
+    If ``rid`` is still running (or paused), the scheduler checks the first
+    ``pos`` tokens against its ledger, writes its KV [0, pos) into the radix
+    tree, and finishes it there (finish_reason abort, message starting with
+    "Truncated"). If it already finished, a /pin_request hold on ``rid``
+    covering ``pos`` is required instead. Either way this request is admitted
+    ahead of the waiting queue with only its appended tokens to prefill."""
+
+    rid: str
+    pos: int
 
 
 # Type definitions for multimodal input data
@@ -388,6 +396,12 @@ class GenerateReqInput:
         Union[List[Optional[Union[Dict, KvHintsEnvelope]]], Dict, KvHintsEnvelope]
     ] = None
 
+    # Joint checkpoint truncate (--enable-joint-checkpoint), single requests
+    # only: {"rid": <request to cut>, "pos": <absolute position>}. input_ids
+    # must be that request's first ``pos`` tokens followed by the appended
+    # ones. See io_struct.TruncateParams.
+    truncate: Optional[Dict[str, Any]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -442,6 +456,8 @@ class GenerateReqInput:
         if self.session_id is not None and self.session_params is not None:
             raise ValueError("session_id and session_params cannot both be set.")
         self._handle_parallel_sampling()
+        if self.truncate is not None:
+            self._validate_truncate()
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -449,6 +465,29 @@ class GenerateReqInput:
             self._normalize_batch_inputs()
 
         self._validate_rid_uniqueness()
+
+    def _validate_truncate(self):
+        """Joint checkpoint truncate: one request given as input_ids, outside
+        session_params, with {"rid": str, "pos": int}."""
+        if not self.is_single:
+            raise ValueError("truncate is not supported for batch requests.")
+        if self.session_params is not None:
+            raise ValueError("truncate and session_params cannot both be set.")
+        if self.input_ids is None:
+            raise ValueError("truncate requires input_ids.")
+        t = self.truncate
+        if (
+            not isinstance(t, dict)
+            or set(t) != {"rid", "pos"}
+            or not isinstance(t["rid"], str)
+            or not t["rid"]
+            or not isinstance(t["pos"], int)
+            or isinstance(t["pos"], bool)
+            or t["pos"] < 0
+        ):
+            raise ValueError(
+                'truncate must be {"rid": <non-empty string>, "pos": <non-negative int>}.'
+            )
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -1186,6 +1225,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     sampling_logprobs_mode: SamplingLogprobsMode = "selected"
     # LoRA adapter name; KV events namespace this request's blocks by it.
     lora_name: Optional[str] = None
+    # Joint checkpoint truncate (GenerateReqInput.truncate). A defaulted tail
+    # field: the Rust server rejects truncate and never emits this slot.
+    truncate: Optional[TruncateParams] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)

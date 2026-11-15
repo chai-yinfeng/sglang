@@ -276,6 +276,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     routed_experts_start_len: int = 0
     return_sampling_mask: Optional[BoolOrList] = None
     modalities: Optional[OptionalStringList] = None
+    truncate: Optional[TruncateParams] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -285,6 +286,22 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GenerateRequest(self)
+
+
+class TruncateParams(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.TruncateParams: JSON object (unknown keys rejected)."""
+
+    rid: str = ""
+    pos: int = 0
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "TruncateParams":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_TruncateParams(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_TruncateParams(self)
 
 
 class ImagesConfig(msgspec.Struct, kw_only=True, frozen=True):
@@ -1497,6 +1514,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["return_sampling_mask"] = None if x is None else decode_BoolOrList(x)
         elif key == "modalities":
             kw["modalities"] = None if x is None else decode_OptionalStringList(x)
+        elif key == "truncate":
+            kw["truncate"] = None if x is None else decode_TruncateParams(x)
     return GenerateRequest(**kw)
 
 
@@ -1578,6 +1597,31 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["return_sampling_mask"] = encode_BoolOrList(v.return_sampling_mask)
     if v.modalities is not None:
         d["modalities"] = encode_OptionalStringList(v.modalities)
+    if v.truncate is not None:
+        d["truncate"] = encode_TruncateParams(v.truncate)
+    return d
+
+
+_FIELDS_TruncateParams = ("rid", "pos",)
+
+
+def decode_TruncateParams(value: Any) -> TruncateParams:
+    m = _expect_map(value, expected="struct TruncateParams")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "rid":
+            kw["rid"] = _expect_str(x, expected="a string")
+        elif key == "pos":
+            kw["pos"] = _expect_int(x, expected="i64")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_TruncateParams)
+    return TruncateParams(**kw)
+
+
+def encode_TruncateParams(v: TruncateParams) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    d["rid"] = v.rid
+    d["pos"] = v.pos
     return d
 
 

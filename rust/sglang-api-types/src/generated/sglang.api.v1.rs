@@ -434,6 +434,21 @@ pub struct GenerateRequest {
     pub return_sampling_mask: ::core::option::Option<BoolOrList>,
     #[prost(message, optional, tag = "40")]
     pub modalities: ::core::option::Option<OptionalStringList>,
+    /// Joint checkpoint truncate (Python server with --enable-joint-checkpoint;
+    /// the Rust server rejects a non-null value). This request continues
+    /// request `rid` from absolute position `pos`: its input_ids start with that
+    /// request's first `pos` tokens.
+    #[prost(message, optional, tag = "41")]
+    pub truncate: ::core::option::Option<TruncateParams>,
+}
+/// Joint checkpoint truncate target: the request to cut and the absolute token
+/// position (into its prompt + output) to cut it at.
+#[derive(Clone, PartialEq, Eq, Hash, ::prost::Message)]
+pub struct TruncateParams {
+    #[prost(string, tag = "1")]
+    pub rid: ::prost::alloc::string::String,
+    #[prost(int64, tag = "2")]
+    pub pos: i64,
 }
 /// Per-request Unlimited-OCR options. The processor owns mode validation and
 /// defaults: an absent image_mode uses "gundam", an empty prefix adds no tokens.

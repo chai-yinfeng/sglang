@@ -157,12 +157,7 @@ class StreamingSession:
         """Keeps a finished or retracted turn's record in the session slot.
         An aborted turn gets the record and the tree lock back and is released
         like any request (returns False); the session re-prefills from its
-        last finished request next turn.
-
-        A turn cut by joint-checkpoint truncate (``req.jc_truncate_to`` set)
-        finishes with an abort reason but takes the keep path: its
-        ``finished_len`` is the cut, so the slot keeps KV [0, truncate_to) and
-        the successor turn borrows it with that prefix."""
+        last finished request next turn."""
         if not _is_streaming(req):
             return False
 
@@ -170,10 +165,7 @@ class StreamingSession:
 
         slot = self.borrowed_slot(req)
         assert slot is not None, f"streaming {req.rid=} does not run on its slot"
-        if (
-            isinstance(req.finished_reason, FINISH_ABORT)
-            and getattr(req, "jc_truncate_to", None) is None
-        ):
+        if isinstance(req.finished_reason, FINISH_ABORT):
             # Hand the record and the tree lock back; the caller releases them.
             del self.slots[req.session.session_id]
             req.lock, slot.lock = slot.lock, None
@@ -210,30 +202,6 @@ class StreamingSession:
             self.cache.checkpoint_into_tree(req, up_to=up_to, **kwargs)
             self._lock_to_slot(req, slot)
         return True
-
-    def truncate_finished_turn(self, req: Req, pos: int) -> Optional[str]:
-        """Joint checkpoint P3 on a turn that already finished: cut the
-        session slot's record to ``pos`` so the next turn borrows KV [0, pos).
-        Returns an error message, or None once the slot is cut. The caller
-        trims the request's token ledger to match."""
-        if not _is_streaming(req):
-            return "request is not a streaming-session turn"
-        slot = self.slots.get(req.session.session_id)
-        if slot is None or not slot.kv.holds_kv:
-            return "session slot holds no KV"
-        if pos < slot.kv.cache_protected_len:
-            return (
-                f"truncate_to={pos} is below the tree-protected prefix "
-                f"{slot.kv.cache_protected_len}"
-            )
-        if pos > slot.kv.kv_allocated_len:
-            return f"truncate_to={pos} is past the slot's KV {slot.kv.kv_allocated_len}"
-        if self.cache.page_size > 1 and slot.kv.max_evicted_seqlen > pos:
-            # Same hazard as _trim_overshoot: the SWA cursor must stay
-            # page-aligned; the partial page is re-prefilled next turn.
-            pos = (pos // self.cache.page_size) * self.cache.page_size
-        self._free_tail(slot.kv, pos)
-        return None
 
     # -- Record ownership --
 

@@ -108,11 +108,19 @@ pub fn into_requests(
         extra_key,
         cache_salt,
         session_params,
+        truncate,
         ..
     } = req;
     if session_params.is_some() {
         return Err(Error::Validation(
             "session_params is not supported by the Rust server".into(),
+        ));
+    }
+    // Joint checkpoint truncate is scheduler state the Rust server does not
+    // forward; dropping it would silently run the request uncut.
+    if truncate.is_some() {
+        return Err(Error::Validation(
+            "truncate is not supported by the Rust server".into(),
         ));
     }
     let rid = rid.and_then(wire::string_or_list);
@@ -1219,6 +1227,18 @@ mod tests {
         let body = format!(r#"{{"text": "hi", {field}}}"#);
         let err = requests(&body).unwrap_err().to_string();
         assert!(err.contains("not supported"), "{field}: {err}");
+    }
+
+    /// Joint checkpoint `truncate` is in the schema but not forwarded to the
+    /// scheduler: a non-null value is a 400, `null` passes.
+    #[test]
+    fn truncate_is_rejected_unless_null() {
+        let (ps, _) = requests(r#"{"text": "hi", "truncate": null}"#).unwrap();
+        assert_eq!(ps.len(), 1);
+        let err = requests(r#"{"text": "hi", "truncate": {"rid": "a", "pos": 3}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("truncate is not supported"), "{err}");
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a

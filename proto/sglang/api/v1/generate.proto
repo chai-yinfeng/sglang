@@ -87,6 +87,21 @@ message GenerateRequest {
   int64 routed_experts_start_len = 38;
   BoolOrList return_sampling_mask = 39;
   OptionalStringList modalities = 40;
+
+  // Joint checkpoint truncate (Python server with --enable-joint-checkpoint;
+  // the Rust server rejects a non-null value). This request continues
+  // request `rid` from absolute position `pos`: its input_ids start with that
+  // request's first `pos` tokens.
+  TruncateParams truncate = 41;
+}
+
+// Joint checkpoint truncate target: the request to cut and the absolute token
+// position (into its prompt + output) to cut it at.
+message TruncateParams {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+
+  string rid = 1;
+  int64 pos = 2;
 }
 
 // Per-request Unlimited-OCR options. The processor owns mode validation and

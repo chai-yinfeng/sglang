@@ -1681,6 +1681,9 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.modalities {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "modalities", v)?;
         }
+        if let Some(v) = &self.truncate {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "truncate", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1736,6 +1739,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_routed_experts_start_len = None;
                 let mut f_return_sampling_mask = None;
                 let mut f_modalities = None;
+                let mut f_truncate = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -2020,6 +2024,12 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_modalities = Some(map.next_value::<Option<OptionalStringList>>()?);
                         }
+                        "truncate" => {
+                            if f_truncate.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("truncate"));
+                            }
+                            f_truncate = Some(map.next_value::<Option<TruncateParams>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2065,6 +2075,60 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     routed_experts_start_len: f_routed_experts_start_len.unwrap_or_default(),
                     return_sampling_mask: f_return_sampling_mask.flatten(),
                     modalities: f_modalities.flatten(),
+                    truncate: f_truncate.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for TruncateParams {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "rid", &self.rid)?;
+        ::serde::ser::SerializeMap::serialize_entry(&mut map, "pos", &self.pos)?;
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for TruncateParams {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["rid", "pos"];
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = TruncateParams;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct TruncateParams")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_rid = None;
+                let mut f_pos = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "rid" => {
+                            if f_rid.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("rid"));
+                            }
+                            f_rid = Some(map.next_value::<::prost::alloc::string::String>()?);
+                        }
+                        "pos" => {
+                            if f_pos.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("pos"));
+                            }
+                            f_pos = Some(map.next_value::<i64>()?);
+                        }
+                        other => {
+                            return Err(::serde::de::Error::unknown_field(other, FIELDS));
+                        }
+                    }
+                }
+                Ok(TruncateParams {
+                    rid: f_rid.unwrap_or_default(),
+                    pos: f_pos.unwrap_or_default(),
                 })
             }
         }
