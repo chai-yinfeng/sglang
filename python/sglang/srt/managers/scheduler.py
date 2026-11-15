@@ -6736,7 +6736,8 @@ class Scheduler(
         """Joint checkpoint bookkeeping run once per scheduling step (from
         get_next_batch_to_run, which the event loop calls every iteration,
         idle or not). Pin expiry runs before, and independent of, pause /
-        resume, which is skipped under speculative decoding."""
+        resume, which is skipped under speculative decoding other than
+        NGRAM."""
         self._jc_expire_pins()
         return self._jc_pause_resume(running_batch)
 
@@ -6755,9 +6756,15 @@ class Scheduler(
 
         Overlap-safe: a request leaves or joins only here, between steps, so
         an in-flight result still lands on a request that is in no batch.
+
+        Under NGRAM every draft is verified in the step that proposed it, so
+        between steps a request has no drafted-but-unverified tokens: a pause
+        drops its per-rid corpus match state (the shared trie is untouched)
+        and the resume batch starts it like a request fresh from prefill
+        (_jc_build_ngram_resume_batch). Other speculative algorithms keep
+        draft state across steps and are not supported.
         """
-        if not self.spec_algorithm.is_none():
-            # Draft state is not carried across a pause; not supported.
+        if self._jc_pause_unsupported_spec() is not None:
             return running_batch
         now = time.monotonic()
 
@@ -6765,6 +6772,13 @@ class Scheduler(
         if to_pause:
             running_batch.filter_batch(reqs_to_exclude=to_pause)
             running_batch.batch_is_full = False
+            if self.spec_algorithm.is_ngram() and self.draft_worker is not None:
+                # NGRAMWorker erases match state only for rids missing from
+                # its next verify batch; a request resumed before such a step
+                # would keep its pre-pause state. Drop it now.
+                self.draft_worker.ngram_corpus.erase_match_state(
+                    [req.rid for req in to_pause]
+                )
             for req in to_pause:
                 if req.jc_pause_reason is None:
                     req.jc_pause_reason = "budget"
@@ -6814,7 +6828,10 @@ class Scheduler(
                 req.jc_paused_at = None
             # A decode batch from requests that already hold their KV; the
             # last output token is relayed as the next input.
-            resume_batch = self._build_hisparse_decode_batch(to_resume)
+            if self.spec_algorithm.is_ngram():
+                resume_batch = self._jc_build_ngram_resume_batch(to_resume)
+            else:
+                resume_batch = self._build_hisparse_decode_batch(to_resume)
             # The builder leaves the per-request lists unset; shape them like
             # prepare_for_extend does so merge_batch / filter_batch stay
             # aligned with reqs when this batch merges with a prefill batch
@@ -6831,12 +6848,84 @@ class Scheduler(
             running_batch.batch_is_full = False
         return running_batch
 
+    def _jc_pause_unsupported_spec(self) -> Optional[str]:
+        """Name of the speculative algorithm that rules out P5 pause/resume,
+        or None (no speculative decoding, or NGRAM)."""
+        if self.spec_algorithm.is_none() or self.spec_algorithm.is_ngram():
+            return None
+        return self.spec_algorithm.name
+
+    def _jc_build_ngram_resume_batch(self, reqs: List[Req]) -> ScheduleBatch:
+        """The resume batch under NGRAM: what _build_hisparse_decode_batch
+        builds, with the spec input an NGRAM request carries from its extend
+        step into its first decode (NGRAMWorker.forward_batch_generation,
+        non-verify branch; relayed like _relay_forward_payload does), except
+        that no accepted tokens are pending: a resumed request's output_ids
+        already holds every token, so draft prep splices nothing and the
+        corpus re-matches from the request's tail. The builder itself is not
+        usable here: it relays a bonus token and an EAGLE-only staged input.
+
+        seq_lens is input + output - 1 (the last output token, the next
+        verify's root, has no KV yet), as after any NGRAM step. Under overlap
+        the verify reads seq_lens from the future map row, last published by
+        the step the request ran before pausing, which equals it."""
+        from sglang.srt.speculative.ngram_info import NgramVerifyInput
+
+        device = self.device
+        batch = ScheduleBatch.init_new(
+            reqs=reqs,
+            req_to_token_pool=self.req_to_token_pool,
+            token_to_kv_pool_allocator=self.token_to_kv_pool_allocator,
+            tree_cache=self.tree_cache,
+            model_config=self.model_config,
+            enable_overlap=self.enable_overlap,
+            spec_algorithm=self.spec_algorithm,
+        )
+        rows = [r.kv.req_pool_idx for r in reqs]
+        batch.req_pool_indices = torch.tensor(rows, dtype=torch.int64, device=device)
+        batch.req_pool_indices_cpu = torch.tensor(rows, dtype=torch.int64)
+        seq_lens = [len(r.origin_input_ids) + len(r.output_ids) - 1 for r in reqs]
+        batch.seq_lens = torch.tensor(seq_lens, dtype=torch.int64, device=device)
+        batch.seq_lens_cpu = torch.tensor(seq_lens, dtype=torch.int64)
+        batch.orig_seq_lens = torch.tensor(seq_lens, dtype=torch.int32, device=device)
+        batch.seq_lens_sum = sum(seq_lens)
+        batch.input_ids = None
+
+        draft_token_num = get_spec().speculative_num_draft_tokens
+        spec_info = NgramVerifyInput(
+            draft_token_num=draft_token_num,
+            new_seq_lens=batch.seq_lens.clone(),
+            accept_tokens=torch.zeros(
+                len(reqs) * draft_token_num, dtype=torch.int32, device=device
+            ),
+            accept_lens=torch.zeros(len(reqs), dtype=torch.int32, device=device),
+        )
+        if self.enable_overlap:
+            # Overwrites the rows' relay left from the step before the pause,
+            # whose tokens are in output_ids by now.
+            self.future_map.stash(
+                batch.req_pool_indices, RelayPayload.from_ngram(spec_info)
+            )
+            spec_info.future_indices = batch.req_pool_indices
+        batch.spec_info = spec_info
+
+        if batch.return_logprob:
+            batch.top_logprobs_nums = [r.logprob.top_logprobs_num for r in reqs]
+            batch.token_ids_logprobs = [list(r.origin_input_ids) for r in reqs]
+        batch.sampling_info = SamplingBatchInfo.from_schedule_batch(
+            batch, self.model_config.vocab_size
+        )
+        return batch
+
     def _jc_control_req(self, rid: str):
         """(req, error) for the P5 control messages."""
         if not self.enable_joint_checkpoint:
             return None, "--enable-joint-checkpoint is not set"
-        if not self.spec_algorithm.is_none():
-            return None, "pause/resume is not supported with speculative decoding"
+        if (algo := self._jc_pause_unsupported_spec()) is not None:
+            return None, (
+                f"pause/resume is not supported with speculative algorithm "
+                f"{algo} (only NGRAM)"
+            )
         req = self._find_inflight_req(rid)
         if req is None or req.finished() or not req.kv.holds_kv:
             return None, f"request {rid} is not running"
