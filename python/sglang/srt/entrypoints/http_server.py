@@ -1751,7 +1751,9 @@ async def pin_request(obj: Annotated[PinReqInput, Body()], request: Request):
 @app.post("/unpin_request")
 @auth_level(AuthLevel.ADMIN_OPTIONAL)
 async def unpin_request(obj: Annotated[UnpinReqInput, Body()], request: Request):
-    """Joint checkpoint: release the hold taken by /pin_request for this rid."""
+    """Joint checkpoint: release the hold taken by /pin_request for this rid.
+    Idempotent: a rid with no hold (never pinned, expired, flushed) answers
+    200 with success=true."""
     result = await _global_state.tokenizer_manager.unpin_request(obj)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)

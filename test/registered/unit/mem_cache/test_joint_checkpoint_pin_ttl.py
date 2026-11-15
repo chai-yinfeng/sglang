@@ -8,8 +8,8 @@ Scheduler.__new__ over a real UnifiedRadixCache:
   --jc-pin-max-ratio x max_total_num_tokens, judged after replacing the
   rid's own earlier hold;
 - flush_cache (and the PD role switch reset) drop the pin table with the tree;
-- unpin of an expired / flushed rid answers "not pinned" without touching
-  the tree.
+- unpin is idempotent: an expired / flushed / never-pinned rid answers
+  success, "was not pinned", without touching the tree; flag off still fails.
 The clock is the scheduler module's ``time`` replaced by a settable stub.
 """
 
@@ -280,15 +280,33 @@ class TestJointCheckpointPinTTL(CustomTestCase):
         self.assertIs(s._jc_on_step(batch), batch)
         self.assertEqual(s.pin_table, {})
 
-    def test_unpin_expired_answers_not_pinned(self):
+    def test_unpin_is_idempotent(self):
+        s = self.make_scheduler()
+        self.add_req("a", 100)
+        self.pin(s, "a", 5)
+        s.tree_cache = MagicMock(wraps=self.cache)
+        out = s.unpin_request(UnpinReqInput(rid="a"))
+        self.assertTrue(out.success)
+        self.assertEqual(out.message, "")
+        s.tree_cache.unlock.assert_called_once()
+        # Unpinning again, or a rid never pinned: success, nothing unlocked.
+        for rid in ("a", "never"):
+            out = s.unpin_request(UnpinReqInput(rid=rid))
+            self.assertTrue(out.success)
+            self.assertEqual(out.message, f"request {rid} was not pinned")
+        s.tree_cache.unlock.assert_called_once()
+
+    def test_unpin_expired_succeeds_as_not_pinned(self):
         s = self.make_scheduler()
         self.add_req("a", 100)
         self.pin(s, "a", 5)
         self.now = 2000.0
         self.step(s)
+        s.tree_cache = MagicMock(wraps=self.cache)
         out = s.unpin_request(UnpinReqInput(rid="a"))
-        self.assertFalse(out.success)
-        self.assertEqual(out.message, "request a is not pinned")
+        self.assertTrue(out.success)
+        self.assertEqual(out.message, "request a was not pinned")
+        s.tree_cache.unlock.assert_not_called()
 
     # ------------------------------------------------------------ cap
 
@@ -350,8 +368,8 @@ class TestJointCheckpointPinTTL(CustomTestCase):
         s.tree_cache.unlock = MagicMock()
         self.step(s)
         out = s.unpin_request(UnpinReqInput(rid="a"))
-        self.assertFalse(out.success)
-        self.assertEqual(out.message, "request a is not pinned")
+        self.assertTrue(out.success)
+        self.assertEqual(out.message, "request a was not pinned")
         s.tree_cache.unlock.assert_not_called()
 
     def test_role_switch_reset_clears_table(self):
@@ -384,6 +402,7 @@ class TestJointCheckpointPinTTL(CustomTestCase):
         self.assertIsNone(out.expires_in_s)
         out = s.unpin_request(UnpinReqInput(rid="a"))
         self.assertFalse(out.success)
+        self.assertEqual(out.message, "--enable-joint-checkpoint is not set")
         self.assertEqual(s.pin_table, {})
         # flush_cache leaves the table alone without the flag (as before).
         s.pin_table = {"x": "sentinel"}

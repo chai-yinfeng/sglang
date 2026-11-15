@@ -6699,9 +6699,11 @@ class Scheduler(
             )
         pin = self.pin_table.pop(recv_req.rid, None)
         if pin is None:
-            # Never pinned, already unpinned, expired, or dropped by flush_cache.
+            # Never pinned, already unpinned, expired, or dropped by
+            # flush_cache: the hold is gone either way, which is what unpin
+            # asks for.
             return UnpinReqOutput(
-                success=False, message=f"request {recv_req.rid} is not pinned"
+                success=True, message=f"request {recv_req.rid} was not pinned"
             )
         self.tree_cache.unlock(pin.lock)
         logger.info(f"joint-checkpoint: unpinned rid={recv_req.rid}")
