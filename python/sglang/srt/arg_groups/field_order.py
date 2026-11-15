@@ -554,5 +554,7 @@ POSITIONAL_FIELD_ORDER = (
     "return_aux_hidden_state_layer_ids",
     "enable_joint_checkpoint",
     "jc_pause_timeout_s",
+    "jc_pin_ttl_s",
+    "jc_pin_max_ratio",
 )
 # fmt: on

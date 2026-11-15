@@ -433,6 +433,18 @@ class _MultimodalInputProcessingError(RuntimeError):
     pass
 
 
+@dataclasses.dataclass
+class JcPin:
+    """Joint checkpoint: one /pin_request hold on the radix tree."""
+
+    lock: TreeLock
+    pinned_len: int
+    # time.monotonic() when taken or last renewed.
+    pinned_at: float
+    # time.monotonic() deadline; None never expires.
+    expires_at: Optional[float]
+
+
 def _accumulate_decode_moment(
     totals: list[float],
     batch_size: int,
@@ -531,8 +543,11 @@ class Scheduler(
         self.enable_session_radix_cache = get_memory().enable_session_radix_cache
         self.enable_joint_checkpoint = get_memory().enable_joint_checkpoint
         # Joint checkpoint: rid -> extra tree lock taken by /pin_request. The
-        # lock outlives the request; /unpin_request or flush_cache releases it.
-        self.pin_table: Dict[str, TreeLock] = {}
+        # lock outlives the request; /unpin_request, its TTL (checked every
+        # scheduling step) or flush_cache releases it.
+        self.pin_table: Dict[str, JcPin] = {}
+        self.jc_pin_ttl_s = get_memory().jc_pin_ttl_s
+        self.jc_pin_max_ratio = get_memory().jc_pin_max_ratio
         # Joint checkpoint P5: rid -> request taken out of the decode batch by
         # pause_request or its lookahead budget. Not in waiting_queue or
         # running_batch; keeps its KV, tree lock and req_to_token row.
@@ -4023,7 +4038,7 @@ class Scheduler(
             running_batch.batch_is_full = False
 
         if self.enable_joint_checkpoint:
-            running_batch = self._jc_pause_resume(running_batch)
+            running_batch = self._jc_on_step(running_batch)
 
         if self.dllm_config is not None:
             new_batch = self.get_new_batch_dllm(running_batch)
@@ -6430,6 +6445,29 @@ class Scheduler(
         up_to = min(
             recv_req.up_to, req.owned_kv_len(), len(req.full_untruncated_fill_ids)
         )
+        # Global cap, checked before anything touches the tree. The hold will
+        # cover at most max(up_to, cache_protected_len) tokens (checkpoint
+        # page-aligns down). The total sums pinned_len over holds, so a prefix
+        # shared by several holds is counted once per hold: a conservative
+        # (over-)estimate of the KV that pins keep out of eviction. A re-pin
+        # of the same rid is judged on the total after the replacement.
+        if self.jc_pin_max_ratio > 0:
+            others = self._jc_pinned_tokens_total() - (
+                self.pin_table[rid].pinned_len if rid in self.pin_table else 0
+            )
+            projected = others + max(up_to, req.kv.cache_protected_len)
+            limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
+            if projected > limit:
+                return PinReqOutput(
+                    success=False,
+                    message=(
+                        f"pin cap exceeded: {others} tokens pinned by other "
+                        f"holds + {projected - others} for {rid} > limit {limit} "
+                        f"(--jc-pin-max-ratio {self.jc_pin_max_ratio} x "
+                        f"{self.max_total_num_tokens})"
+                    ),
+                    pinned_tokens_total=self._jc_pinned_tokens_total(),
+                )
         if up_to > req.kv.cache_protected_len:
             # checkpoint page-aligns the insert and moves req.lock / req.last_node
             # to the node it ended on.
@@ -6442,30 +6480,75 @@ class Scheduler(
             return PinReqOutput(
                 success=False, pinned_len=0, message="tree did not hand out a lock"
             )
-        # Re-pinning the same rid replaces the earlier hold.
-        old_lock = self.pin_table.pop(rid, None)
-        self.pin_table[rid] = new_lock
-        if old_lock is not None:
-            self.tree_cache.unlock(old_lock)
+        ttl_s = recv_req.ttl_s if recv_req.ttl_s is not None else self.jc_pin_ttl_s
+        now = time.monotonic()
+        expires_at = now + ttl_s if ttl_s > 0 else None
+        # Re-pinning the same rid replaces the earlier hold and restarts its TTL.
+        old_pin = self.pin_table.pop(rid, None)
+        self.pin_table[rid] = JcPin(
+            lock=new_lock, pinned_len=pinned_len, pinned_at=now, expires_at=expires_at
+        )
+        if old_pin is not None:
+            self.tree_cache.unlock(old_pin.lock)
+        expires_in_s = ttl_s if expires_at is not None else None
+        pinned_tokens_total = self._jc_pinned_tokens_total()
         logger.info(
             f"joint-checkpoint: pinned rid={rid} len={pinned_len} "
-            f"(requested up_to={recv_req.up_to})"
+            f"(requested up_to={recv_req.up_to}) expires_in_s={expires_in_s} "
+            f"pinned_tokens_total={pinned_tokens_total}"
         )
-        return PinReqOutput(success=True, pinned_len=pinned_len)
+        return PinReqOutput(
+            success=True,
+            pinned_len=pinned_len,
+            expires_in_s=expires_in_s,
+            pinned_tokens_total=pinned_tokens_total,
+        )
 
     def unpin_request(self, recv_req: UnpinReqInput):
         if not self.enable_joint_checkpoint:
             return UnpinReqOutput(
                 success=False, message="--enable-joint-checkpoint is not set"
             )
-        lock = self.pin_table.pop(recv_req.rid, None)
-        if lock is None:
+        pin = self.pin_table.pop(recv_req.rid, None)
+        if pin is None:
+            # Never pinned, already unpinned, expired, or dropped by flush_cache.
             return UnpinReqOutput(
-                success=False, message=f"no pin for request {recv_req.rid}"
+                success=False, message=f"request {recv_req.rid} is not pinned"
             )
-        self.tree_cache.unlock(lock)
+        self.tree_cache.unlock(pin.lock)
         logger.info(f"joint-checkpoint: unpinned rid={recv_req.rid}")
         return UnpinReqOutput(success=True)
+
+    def _jc_pinned_tokens_total(self) -> int:
+        """Sum of pinned_len over the holds; a prefix shared by several holds
+        is counted once per hold."""
+        return sum(pin.pinned_len for pin in self.pin_table.values())
+
+    def _jc_expire_pins(self) -> None:
+        """Release the /pin_request holds whose TTL has passed."""
+        if not self.pin_table:
+            return
+        now = time.monotonic()
+        expired = [
+            rid
+            for rid, pin in self.pin_table.items()
+            if pin.expires_at is not None and now >= pin.expires_at
+        ]
+        for rid in expired:
+            pin = self.pin_table.pop(rid)
+            self.tree_cache.unlock(pin.lock)
+            logger.info(
+                f"joint-checkpoint: pin expired rid={rid} len={pin.pinned_len} "
+                f"after {now - pin.pinned_at:.1f}s"
+            )
+
+    def _jc_on_step(self, running_batch: ScheduleBatch) -> ScheduleBatch:
+        """Joint checkpoint bookkeeping run once per scheduling step (from
+        get_next_batch_to_run, which the event loop calls every iteration,
+        idle or not). Pin expiry runs before, and independent of, pause /
+        resume, which is skipped under speculative decoding."""
+        self._jc_expire_pins()
+        return self._jc_pause_resume(running_batch)
 
     def _jc_pause_resume(self, running_batch: ScheduleBatch) -> ScheduleBatch:
         """Joint checkpoint P5, run once per scheduling step on the running

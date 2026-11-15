@@ -2441,9 +2441,12 @@ class ConfigureLoggingReq(BaseReq, kw_only=True):
 class PinReqInput(BaseReq, kw_only=True):
     """Joint checkpoint: hold the running request ``rid``'s KV prefix
     ``[0, up_to)`` in the radix tree until ``UnpinReqInput`` for the same rid.
-    The hold is independent of the request's lifetime."""
+    The hold is independent of the request's lifetime, but expires after
+    ``ttl_s`` seconds (default ``--jc-pin-ttl-s``; <= 0 never expires).
+    Pinning the same rid again replaces the hold and restarts its TTL."""
 
     up_to: int
+    ttl_s: Optional[float] = None
 
 
 class PinReqOutput(BaseReq, kw_only=True):
@@ -2451,6 +2454,11 @@ class PinReqOutput(BaseReq, kw_only=True):
     # Tokens actually held (``up_to`` clamped to the request's KV and page-aligned).
     pinned_len: int = 0
     message: str = ""
+    # Seconds until the hold expires; None when it never expires.
+    expires_in_s: Optional[float] = None
+    # Sum of pinned_len over all holds after this call (shared prefixes counted
+    # once per hold).
+    pinned_tokens_total: int = 0
 
 
 class UnpinReqInput(BaseReq, kw_only=True):

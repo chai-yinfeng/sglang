@@ -290,5 +290,8 @@ def _release_prefix_cache_for_role_switch(scheduler: Scheduler) -> None:
             except Exception:
                 logger.exception("hicache storage release on role switch failed")
         tree_cache.reset()
+        if scheduler.enable_joint_checkpoint:
+            # As in flush_cache: pinned nodes do not survive the reset.
+            scheduler.pin_table.clear()
     scheduler.req_to_token_pool.clear()
     scheduler.token_to_kv_pool_allocator.clear()

@@ -99,6 +99,14 @@ class Memory(msgspec.Struct):
         float,
         "Joint checkpoint: a request paused by /pause_request or by its lookahead budget for longer than this many seconds is aborted (finish_reason abort, pause timeout). Only used with --enable-joint-checkpoint.",
     ] = 300.0
+    jc_pin_ttl_s: A[
+        float,
+        "Joint checkpoint: a /pin_request hold is released this many seconds after it was taken (or last renewed by pinning the same rid again), unless the request sets its own ttl_s. <= 0 never expires. Only used with --enable-joint-checkpoint.",
+    ] = 600.0
+    jc_pin_max_ratio: A[
+        float,
+        "Joint checkpoint: /pin_request is refused when the pinned tokens (sum over holds, shared prefixes counted once per hold) would exceed this fraction of the KV pool. <= 0 disables the cap. Only used with --enable-joint-checkpoint.",
+    ] = 0.5
 
     # -------------------------------------------------------------------------
     # Hierarchical cache
