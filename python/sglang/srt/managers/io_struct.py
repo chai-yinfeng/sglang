@@ -2540,7 +2540,9 @@ class PinReqInput(BaseReq, kw_only=True):
     ``--jc-pin-ttl-s``; must be in (0, --jc-pin-max-ttl-s]). Pinning a running
     rid again replaces the hold and restarts its TTL; pinning a rid that is no
     longer running renews the TTL of its existing hold, whose coverage cannot
-    grow (``up_to`` past it is refused)."""
+    grow (``up_to`` past it is refused). If that hold was degraded under pin
+    pressure, the part of its path still in the tree is pinned again, like a
+    new pin; ``pinned_len`` in the reply says how much survived."""
 
     up_to: Optional[int] = None
     ttl_s: Optional[float] = None
@@ -2557,10 +2559,12 @@ class PinReqOutput(BaseReq, kw_only=True):
     pinned_tokens_total: int = 0
     # Sum of pinned_len over all holds (a shared prefix once per hold); debug.
     pinned_tokens_sum: int = 0
-    # Pins this call degraded to make room (--jc-pin-overflow lru), and the
-    # number of pins degraded since the server started.
+    # Pins this call degraded to make room (--jc-pin-overflow lru), the number
+    # of pins degraded since the server started, and of degraded pins renewed
+    # (re-pinned) since then.
     degraded: List[str] = []
     pins_degraded_total: int = 0
+    pins_repinned_total: int = 0
 
 
 class UnpinReqInput(BaseReq, kw_only=True):

@@ -161,6 +161,7 @@ class TestJointCheckpointPinTTL(CustomTestCase):
         s.jc_pin_overflow = overflow
         s.jc_degraded_pins = {}
         s.jc_pins_degraded_total = 0
+        s.jc_pins_repinned_total = 0
         s.max_total_num_tokens = POOL_SIZE
         s.tree_cache = self.cache
         s.paused_reqs = {}

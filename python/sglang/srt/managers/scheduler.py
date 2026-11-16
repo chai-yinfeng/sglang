@@ -322,13 +322,18 @@ from sglang.srt.managers.utils import (
 )
 from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
-from sglang.srt.mem_cache.base_prefix_cache import CacheRequestOutcome, TreeLock
+from sglang.srt.mem_cache.base_prefix_cache import (
+    CacheRequestOutcome,
+    MatchPrefixParams,
+    TreeLock,
+)
 from sglang.srt.mem_cache.common import (
     checkpoint_kv_cache,
     discard_kv_cache_backup,
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
 from sglang.srt.model_loader.utils import get_resolved_model_impl
@@ -463,6 +468,11 @@ class JcPin:
     # Truncate hold: the rid of the request that was cut. Released once the
     # keyed request is admitted (it then holds the prefix itself) or aborted.
     successor_of: Optional[str] = None
+    # Client pin / pin-on-finish hold: its token path [0, pinned_len) and
+    # namespace, so a degraded pin can be matched again after eviction.
+    key: Optional[RadixKey] = None
+    # time.monotonic() when the pressure valve dropped its lock.
+    degraded_at: Optional[float] = None
 
 
 def _accumulate_decode_moment(
@@ -577,10 +587,11 @@ class Scheduler(
         self.jc_pin_max_ttl_s = get_memory().jc_pin_max_ttl_s
         self.jc_pin_max_ratio = get_memory().jc_pin_max_ratio
         self.jc_pin_overflow = get_memory().jc_pin_overflow
-        # Pin pressure valve: rid -> time.monotonic() its pin was degraded (lock
-        # dropped to make room for a newer pin), so a renewal can say so.
-        self.jc_degraded_pins: Dict[str, float] = {}
+        # Pin pressure valve: rid -> pin whose lock was dropped to make room for
+        # a newer pin; a renewal re-pins what of its path is still in the tree.
+        self.jc_degraded_pins: Dict[str, JcPin] = {}
         self.jc_pins_degraded_total = 0
+        self.jc_pins_repinned_total = 0
         # Joint checkpoint P5: rid -> request taken out of the decode batch by
         # pause_request or its lookahead budget. Not in waiting_queue or
         # running_batch; keeps its KV, tree lock and req_to_token row.
@@ -6676,6 +6687,7 @@ class Scheduler(
                 pinned_tokens_total=self._jc_pinned_tokens_total(),
                 pinned_tokens_sum=self._jc_pinned_tokens_sum(),
                 pins_degraded_total=self.jc_pins_degraded_total,
+                pins_repinned_total=self.jc_pins_repinned_total,
             )
         if up_to > req.kv.cache_protected_len:
             # checkpoint page-aligns the insert and moves req.lock / req.last_node
@@ -6685,7 +6697,11 @@ class Scheduler(
         # a shorter up_to is covered by holding that node.
         pinned_len = req.kv.cache_protected_len
         if not self._jc_take_hold(
-            rid=rid, node=req.last_node, pinned_len=pinned_len, ttl_s=ttl_s
+            rid=rid,
+            node=req.last_node,
+            pinned_len=pinned_len,
+            ttl_s=ttl_s,
+            key=self._jc_pin_key(req, pinned_len),
         ):
             return PinReqOutput(
                 success=False,
@@ -6693,6 +6709,7 @@ class Scheduler(
                 message="tree did not hand out a lock",
                 degraded=degraded,
                 pins_degraded_total=self.jc_pins_degraded_total,
+                pins_repinned_total=self.jc_pins_repinned_total,
             )
         out = self._jc_pin_output(pinned_len=pinned_len, ttl_s=ttl_s, degraded=degraded)
         logger.info(
@@ -6707,19 +6724,13 @@ class Scheduler(
         self, *, rid: str, up_to: Optional[int], ttl_s: float
     ) -> PinReqOutput:
         """/pin_request on a rid that is not running: restart the TTL of its
-        unexpired client pin or pin-on-finish hold (not a truncate hold).
-        Coverage stays as it is; an ``up_to`` past it is refused, since the
-        finished request's KV past the hold is gone."""
+        unexpired client pin or pin-on-finish hold (not a truncate hold), or
+        re-pin its degraded pin (_jc_repin_degraded). Coverage stays as it
+        is; an ``up_to`` past it is refused, since the finished request's KV
+        past the hold is gone."""
         pin = self.pin_table.get(rid)
         if pin is None and rid in self.jc_degraded_pins:
-            return PinReqOutput(
-                success=False,
-                message=(
-                    f"request {rid} is not running and its pin was degraded "
-                    f"under pin pressure; its KV is evictable and is not re-pinned"
-                ),
-                pins_degraded_total=self.jc_pins_degraded_total,
-            )
+            return self._jc_repin_degraded(rid=rid, up_to=up_to, ttl_s=ttl_s)
         if (
             pin is None
             or pin.successor_of is not None
@@ -6744,6 +6755,65 @@ class Scheduler(
         )
         return self._jc_pin_output(pinned_len=pin.pinned_len, ttl_s=ttl_s)
 
+    def _jc_repin_degraded(
+        self, *, rid: str, up_to: Optional[int], ttl_s: float
+    ) -> PinReqOutput:
+        """Renewal of a degraded pin: hold again the longest prefix of its old
+        path still in the tree (eviction may have taken its tail), admitted
+        like a new pin (cap, --jc-pin-overflow). pinned_len reports what
+        survived; nothing surviving is a failure."""
+        old = self.jc_degraded_pins[rid]
+        if up_to is not None and up_to > old.pinned_len:
+            return PinReqOutput(
+                success=False,
+                message=(
+                    f"request {rid} is not running; its degraded pin covered "
+                    f"{old.pinned_len} tokens and cannot be extended to {up_to}"
+                ),
+            )
+        match = self.tree_cache.match_prefix(MatchPrefixParams(key=old.key))
+        survived, node = match.device_prefix_len, match.last_device_node
+        if survived <= 0:
+            del self.jc_degraded_pins[rid]
+            return PinReqOutput(
+                success=False,
+                message=(
+                    f"request {rid} is not running and its degraded pin's KV "
+                    f"was evicted; nothing to re-pin"
+                ),
+                pins_degraded_total=self.jc_pins_degraded_total,
+                pins_repinned_total=self.jc_pins_repinned_total,
+            )
+        refusal, degraded = self._jc_make_room(rid=rid, node=node)
+        if refusal is None and not self._jc_take_hold(
+            rid=rid,
+            node=node,
+            pinned_len=survived,
+            ttl_s=ttl_s,
+            key=RadixKey(
+                old.key.token_ids[:survived],
+                old.key.extra_key,
+                cache_salt=old.key.cache_salt,
+            ),
+        ):
+            refusal = "tree did not hand out a lock"
+        if refusal is not None:
+            return PinReqOutput(
+                success=False,
+                message=refusal,
+                degraded=degraded,
+                pinned_tokens_total=self._jc_pinned_tokens_total(),
+                pinned_tokens_sum=self._jc_pinned_tokens_sum(),
+                pins_degraded_total=self.jc_pins_degraded_total,
+                pins_repinned_total=self.jc_pins_repinned_total,
+            )
+        self.jc_pins_repinned_total += 1
+        logger.info(
+            f"joint-checkpoint: re-pinned degraded rid={rid} len={survived} "
+            f"of {old.pinned_len} expires_in_s={ttl_s} degraded={degraded}"
+        )
+        return self._jc_pin_output(pinned_len=survived, ttl_s=ttl_s, degraded=degraded)
+
     def _jc_pin_output(
         self, *, pinned_len: int, ttl_s: float, degraded: Sequence[str] = ()
     ) -> PinReqOutput:
@@ -6755,6 +6825,7 @@ class Scheduler(
             pinned_tokens_sum=self._jc_pinned_tokens_sum(),
             degraded=list(degraded),
             pins_degraded_total=self.jc_pins_degraded_total,
+            pins_repinned_total=self.jc_pins_repinned_total,
         )
 
     def _jc_ttl_refusal(self, ttl_s: float) -> Optional[str]:
@@ -6836,7 +6907,8 @@ class Scheduler(
         pin = self.pin_table.pop(rid)
         self.tree_cache.unlock(pin.lock)
         now = time.monotonic()
-        self.jc_degraded_pins[rid] = now
+        pin.degraded_at = now
+        self.jc_degraded_pins[rid] = pin
         self.jc_pins_degraded_total += 1
         logger.info(
             f"joint-checkpoint: degraded pin rid={rid} len={pin.pinned_len} "
@@ -6844,11 +6916,17 @@ class Scheduler(
         )
 
     def _jc_take_hold(
-        self, *, rid: str, node: Any, pinned_len: int, ttl_s: float
+        self,
+        *,
+        rid: str,
+        node: Any,
+        pinned_len: int,
+        ttl_s: float,
+        key: Optional[RadixKey],
     ) -> bool:
-        """Lock ``node`` (ending [0, pinned_len) in the tree) as the pin of
-        ``rid`` for ``ttl_s`` seconds. An earlier hold of
-        the rid is replaced and unlocked, restarting the TTL. False, with
+        """Lock ``node`` (ending [0, pinned_len) in the tree, whose path is
+        ``key``) as the pin of ``rid`` for ``ttl_s`` seconds. An earlier hold
+        of the rid is replaced and unlocked, restarting the TTL. False, with
         nothing changed, when the tree hands out no lock."""
         new_lock = self.tree_cache.lock(node)
         if new_lock is None:
@@ -6861,10 +6939,20 @@ class Scheduler(
             pinned_len=pinned_len,
             pinned_at=now,
             expires_at=now + ttl_s,
+            key=key,
         )
         if old_pin is not None:
             self.tree_cache.unlock(old_pin.lock)
         return True
+
+    @staticmethod
+    def _jc_pin_key(req: Req, pinned_len: int) -> RadixKey:
+        """The tree key of ``req``'s first ``pinned_len`` tokens."""
+        return RadixKey(
+            array("q", req.full_untruncated_fill_ids[:pinned_len]),
+            req.extra_key,
+            cache_salt=req.cache_salt,
+        )
 
     def _jc_arm_pin_on_finish(
         self, req: Req, recv_req: TokenizedGenerateReqInput
@@ -6917,7 +7005,11 @@ class Scheduler(
         else:
             refusal, degraded = self._jc_make_room(rid=req.rid, node=req.last_node)
         if refusal is None and not self._jc_take_hold(
-            rid=req.rid, node=req.last_node, pinned_len=pinned_len, ttl_s=ttl_s
+            rid=req.rid,
+            node=req.last_node,
+            pinned_len=pinned_len,
+            ttl_s=ttl_s,
+            key=self._jc_pin_key(req, pinned_len),
         ):
             refusal = "tree did not hand out a lock"
         if refusal is not None:
@@ -6986,9 +7078,9 @@ class Scheduler(
         now = time.monotonic()
         if self.jc_degraded_pins:
             self.jc_degraded_pins = {
-                rid: at
-                for rid, at in self.jc_degraded_pins.items()
-                if now - at < self.jc_pin_max_ttl_s
+                rid: pin
+                for rid, pin in self.jc_degraded_pins.items()
+                if now - pin.degraded_at < self.jc_pin_max_ttl_s
             }
         if not self.pin_table:
             return

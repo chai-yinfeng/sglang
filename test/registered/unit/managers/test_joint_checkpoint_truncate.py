@@ -209,6 +209,7 @@ class _TruncateFixture(CustomTestCase):
         s.jc_pin_overflow = overflow
         s.jc_degraded_pins = {}
         s.jc_pins_degraded_total = 0
+        s.jc_pins_repinned_total = 0
         s.max_total_num_tokens = self.pool_size
         s.paused_reqs = {}
         s.jc_pause_timeout_s = 1e9
@@ -1253,12 +1254,60 @@ class TestJointCheckpointPinPressureValve(_PinOnFinishFixture):
         self.assertEqual(set(s.pin_table), {"a"})
         self.assertEqual(b.kv.cache_protected_len, 0)
 
-    def test_renew_and_unpin_after_degrade(self):
+    def test_renew_repins_a_degraded_pin_like_a_new_pin(self):
+        s, _ = self.three_then_a_fourth("lru")  # a degraded; b, c held
+        self.now = 1003.0
+        out = s.pin_request(PinReqInput(rid="a", ttl_s=60.0))
+        self.assertTrue(out.success, out.message)
+        self.assertEqual(out.pinned_len, 16)
+        # Admitted through the valve: b is now the least recently touched.
+        self.assertEqual(out.degraded, ["b"])
+        self.assertEqual((out.pins_degraded_total, out.pins_repinned_total), (2, 1))
+        self.assertEqual(set(s.pin_table), {"a", "c"})
+        self.assertEqual(set(s.jc_degraded_pins), {"b"})
+        pin = s.pin_table["a"]
+        self.assertEqual((pin.pinned_at, pin.expires_at), (1003.0, 1063.0))
+        # Held again: eviction no longer reaches it.
+        self.evict_all()
+        self.assertEqual(self.match_len(self.prompt(0) + OUTPUT), 16)
+
+    def test_repin_holds_what_survived_eviction(self):
         s, _ = self.three_then_a_fourth("lru")
+        # Something else holds a's prompt, so eviction takes only its output.
+        prompt_node = self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", self.prompt(0))))
+        ).last_device_node
+        other = self.cache.lock(prompt_node)
+        self.evict_all()
+        s.unpin_request(UnpinReqInput(rid="c"))  # make room without degrading
+        out = s.pin_request(PinReqInput(rid="a"))
+        self.assertTrue(out.success, out.message)
+        self.assertEqual((out.pinned_len, out.degraded), (len(PROMPT), []))
+        self.assertEqual(s.pin_table["a"].pinned_len, len(PROMPT))
+        self.cache.unlock(other)
+
+    def test_repin_of_an_evicted_pin_fails(self):
+        s, _ = self.three_then_a_fourth("lru")
+        self.evict_all()
         out = s.pin_request(PinReqInput(rid="a"))
         self.assertFalse(out.success)
-        self.assertIn("degraded under pin pressure", out.message)
-        self.assertNotIn("a", s.pin_table)
+        self.assertIn("degraded pin's KV was evicted", out.message)
+        self.assertEqual((out.pinned_len, out.pins_repinned_total), (0, 0))
+        self.assertEqual(set(s.pin_table), {"b", "c"})
+        out = s.pin_request(PinReqInput(rid="a"))
+        self.assertEqual(out.message, "request a is not running")
+
+    def test_repin_in_refuse_mode_is_refused_over_the_cap(self):
+        s, _ = self.three_then_a_fourth("lru")
+        s.jc_pin_overflow = "refuse"
+        out = s.pin_request(PinReqInput(rid="a"))
+        self.assertFalse(out.success)
+        self.assertIn("pin cap exceeded", out.message)
+        self.assertEqual(set(s.pin_table), {"b", "c"})
+        self.assertIn("a", s.jc_degraded_pins)
+
+    def test_unpin_after_degrade(self):
+        s, _ = self.three_then_a_fourth("lru")
         out = s.unpin_request(UnpinReqInput(rid="a"))
         self.assertTrue(out.success)
         self.assertIn("degraded", out.message)
