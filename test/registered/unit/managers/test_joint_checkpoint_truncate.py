@@ -30,6 +30,10 @@ real Req objects.
 - Distinct accounting (TestJointCheckpointDistinctPinAccounting, Rust and
   Python tree cores): the pin cap counts each tree token held by any pin
   once, across node splits and in any release order.
+- Pin pressure valve (TestJointCheckpointPinPressureValve*): with
+  --jc-pin-overflow lru a pin over the cap degrades other pins, least
+  recently touched first and only those whose release makes room; a pin that
+  cannot fit is refused with nothing degraded; refuse mode is unchanged.
 """
 
 import itertools
@@ -190,7 +194,9 @@ class _TruncateFixture(CustomTestCase):
 
     # ------------------------------------------------------------ fixtures
 
-    def make_scheduler(self, running=(), enable=True, streamer=None, max_ratio=0.5):
+    def make_scheduler(
+        self, running=(), enable=True, streamer=None, max_ratio=0.5, overflow="refuse"
+    ):
         s = Scheduler.__new__(Scheduler)
         s.enable_joint_checkpoint = enable
         s.disaggregation_mode = DisaggregationMode.NULL
@@ -200,6 +206,9 @@ class _TruncateFixture(CustomTestCase):
         s.jc_pin_ttl_s = 600.0
         s.jc_pin_max_ttl_s = 3600.0
         s.jc_pin_max_ratio = max_ratio
+        s.jc_pin_overflow = overflow
+        s.jc_degraded_pins = {}
+        s.jc_pins_degraded_total = 0
         s.max_total_num_tokens = self.pool_size
         s.paused_reqs = {}
         s.jc_pause_timeout_s = 1e9
@@ -1103,11 +1112,7 @@ def session_prompt(i):
     return SHARED_PREFIX + list(range(start, start + TAIL_LEN - 1))
 
 
-class TestJointCheckpointDistinctPinAccounting(_PinOnFinishFixture):
-    """The pin cap counts the distinct tree tokens held by any pin: a prefix
-    shared by several holds counts once, read off the tree so a node split
-    under a held path changes nothing."""
-
+class _SharedPrefixFixture(_PinOnFinishFixture):
     pool_size = 32768
     max_context_len = 8192
 
@@ -1115,6 +1120,12 @@ class TestJointCheckpointDistinctPinAccounting(_PinOnFinishFixture):
         req = self.armed(s, f"r{i}", prompt=session_prompt(i), outputs=[7])
         self.finish(req)
         return req
+
+
+class TestJointCheckpointDistinctPinAccounting(_SharedPrefixFixture):
+    """The pin cap counts the distinct tree tokens held by any pin: a prefix
+    shared by several holds counts once, read off the tree so a node split
+    under a held path changes nothing."""
 
     def test_shared_prefix_counted_once_across_a_split(self):
         s = self.make_scheduler()
@@ -1166,6 +1177,127 @@ class TestJointCheckpointDistinctPinAccountingPythonCore(
     TestJointCheckpointDistinctPinAccounting
 ):
     tree_core_backend = "python"
+
+
+class TestJointCheckpointPinPressureValve(_PinOnFinishFixture):
+    """--jc-pin-overflow lru: a pin over --jc-pin-max-ratio degrades other
+    pins, least recently pinned or renewed first, instead of being refused.
+    Prompts are disjoint, so every 16-token hold counts in full."""
+
+    def prompt(self, k):
+        return [p + 1000 * (k + 1) for p in PROMPT]
+
+    def held_at(self, s, rid, k, t):
+        self.now = t
+        req = self.armed(s, rid, prompt=self.prompt(k))
+        self.finish(req)
+        return req
+
+    def three_then_a_fourth(self, overflow):
+        """a, b, c finish with holds at t = 1000, 1001, 1002 under a 40-token
+        limit (int(0.16 x 256)): c needs room."""
+        s = self.make_scheduler(max_ratio=0.16, overflow=overflow)
+        self.held_at(s, "a", 0, 1000.0)
+        self.held_at(s, "b", 1, 1001.0)
+        c = self.held_at(s, "c", 2, 1002.0)
+        return s, c
+
+    def test_degrades_least_recently_touched_first(self):
+        s, c = self.three_then_a_fourth("lru")
+        self.assertEqual(
+            c.jc_pin_outcome, {"jc_pinned_len": 16, "jc_pin_degraded": ["a"]}
+        )
+        self.assertEqual(set(s.pin_table), {"b", "c"})
+        # A renewal touches b, so c is now the least recently touched.
+        self.now = 1003.0
+        self.assertTrue(s.pin_request(PinReqInput(rid="b")).success)
+        self.now = 1004.0
+        d = self.start("d", self.prompt(3), OUTPUT)
+        s.running_batch.reqs = s.running_batch.reqs + [d]
+        out = s.pin_request(PinReqInput(rid="d"))
+        self.assertTrue(out.success, out.message)
+        self.assertEqual(out.degraded, ["c"])
+        self.assertEqual((out.pinned_tokens_total, out.pins_degraded_total), (32, 2))
+        self.assertEqual(set(s.pin_table), {"b", "d"})
+        # Degraded KV is not freed, only evictable.
+        a_fill = self.prompt(0) + OUTPUT
+        self.assertEqual(self.match_len(a_fill), 16)
+        self.evict_all()
+        self.assertEqual(self.match_len(a_fill), 0)
+        self.assertEqual(self.match_len(self.prompt(1) + OUTPUT), 16)
+
+    def test_refuse_mode_keeps_first_come_first_served(self):
+        s, c = self.three_then_a_fourth("refuse")
+        self.assertEqual(
+            c.jc_pin_outcome,
+            {
+                "jc_pinned_len": 0,
+                "jc_pin_message": "pin cap exceeded: 48 distinct pinned tokens "
+                "with this hold on c (32 without it) > limit 40 "
+                "(--jc-pin-max-ratio 0.16 x 256)",
+            },
+        )
+        self.assertEqual(set(s.pin_table), {"a", "b"})
+        self.assertEqual((s.jc_degraded_pins, s.jc_pins_degraded_total), ({}, 0))
+
+    def test_infeasible_pin_is_refused_with_nothing_degraded(self):
+        s = self.make_scheduler(max_ratio=0.16, overflow="lru")
+        self.held_at(s, "a", 0, 1000.0)
+        s.jc_pin_max_ratio = 0.05  # limit 12: a 16-token pin cannot fit alone
+        b = self.start("b", self.prompt(1), OUTPUT)
+        s.running_batch.reqs = s.running_batch.reqs + [b]
+        out = s.pin_request(PinReqInput(rid="b"))
+        self.assertFalse(out.success)
+        self.assertIn("degrading every other pin would not make room", out.message)
+        self.assertEqual((out.degraded, out.pins_degraded_total), ([], 0))
+        self.assertEqual(set(s.pin_table), {"a"})
+        self.assertEqual(b.kv.cache_protected_len, 0)
+
+    def test_renew_and_unpin_after_degrade(self):
+        s, _ = self.three_then_a_fourth("lru")
+        out = s.pin_request(PinReqInput(rid="a"))
+        self.assertFalse(out.success)
+        self.assertIn("degraded under pin pressure", out.message)
+        self.assertNotIn("a", s.pin_table)
+        out = s.unpin_request(UnpinReqInput(rid="a"))
+        self.assertTrue(out.success)
+        self.assertIn("degraded", out.message)
+        out = s.unpin_request(UnpinReqInput(rid="a"))
+        self.assertEqual(out.message, "request a was not pinned")
+        # The degraded mark outlives no lease: forgotten after --jc-pin-max-ttl-s.
+        self.held_at(s, "e", 4, 1010.0)  # degrades b
+        self.now = 1010.0 + 3600.0
+        s._jc_on_step(ScheduleBatch(reqs=[], batch_is_full=False))
+        out = s.pin_request(PinReqInput(rid="b"))
+        self.assertEqual(out.message, "request b is not running")
+
+
+class TestJointCheckpointPinPressureValveShared(_SharedPrefixFixture):
+    """Room is counted in distinct tree tokens: degrading a pin whose path
+    the kept pins or the new hold share frees nothing, so it is spared."""
+
+    def test_only_pins_that_free_room_are_degraded(self):
+        # limit 12000 (int(0.3663 x 32768)): prefix 4300 + two tails fit
+        # (11700), a third tail does not (15400).
+        s = self.make_scheduler(max_ratio=0.3663, overflow="lru")
+        prefix_only = self.start("p", SHARED_PREFIX + [1, 2, 3], [7])
+        s.running_batch.reqs = s.running_batch.reqs + [prefix_only]
+        self.now = 999.0
+        out = s.pin_request(PinReqInput(rid="p", up_to=PREFIX_LEN))
+        self.assertEqual(out.pinned_len, PREFIX_LEN)
+        self.now = 1000.0
+        self.hold(s, 0)
+        self.now = 1001.0
+        self.hold(s, 1)
+        self.assertEqual(s._jc_pinned_tokens_total(), PREFIX_LEN + 2 * TAIL_LEN)
+        self.now = 1002.0
+        r2 = self.hold(s, 2)
+        # p is the least recently touched, but its prefix stays held by r1
+        # and r2: degrading it frees nothing. r0's tail is what makes room.
+        self.assertEqual(r2.jc_pin_outcome["jc_pin_degraded"], ["r0"])
+        self.assertEqual(set(s.pin_table), {"p", "r1", "r2"})
+        self.assertEqual(s._jc_pinned_tokens_total(), PREFIX_LEN + 2 * TAIL_LEN)
+
 
 
 # ---------------------------------------------------------------- exclusive admission

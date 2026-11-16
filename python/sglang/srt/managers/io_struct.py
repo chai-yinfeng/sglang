@@ -181,7 +181,8 @@ class PinOnFinishParams(msgspec.Struct, kw_only=True, array_like=True):
     pin_table record, TTL ``ttl_s`` (None uses --jc-pin-ttl-s; must be in
     (0, --jc-pin-max-ttl-s]) and --jc-pin-max-ratio cap. The outcome is reported in the final
     chunk's meta_info as ``jc_pinned_len`` (and ``jc_pin_message`` when
-    nothing was pinned)."""
+    nothing was pinned, ``jc_pin_degraded`` when older pins were degraded to
+    make room)."""
 
     ttl_s: Optional[float] = None
 
@@ -2556,6 +2557,10 @@ class PinReqOutput(BaseReq, kw_only=True):
     pinned_tokens_total: int = 0
     # Sum of pinned_len over all holds (a shared prefix once per hold); debug.
     pinned_tokens_sum: int = 0
+    # Pins this call degraded to make room (--jc-pin-overflow lru), and the
+    # number of pins degraded since the server started.
+    degraded: List[str] = []
+    pins_degraded_total: int = 0
 
 
 class UnpinReqInput(BaseReq, kw_only=True):

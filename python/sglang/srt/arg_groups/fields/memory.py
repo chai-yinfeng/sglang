@@ -111,6 +111,20 @@ class Memory(msgspec.Struct):
         float,
         "Joint checkpoint: /pin_request is refused when the distinct tree tokens held by pins (a prefix shared by several holds counted once) would exceed this fraction of the KV pool. <= 0 disables the cap. Only used with --enable-joint-checkpoint.",
     ] = 0.5
+    jc_pin_overflow: A[
+        str,
+        Arg(
+            help=(
+                "Joint checkpoint: what a new pin does when --jc-pin-max-ratio "
+                "would be exceeded. 'lru' degrades other pins, least recently "
+                "pinned or renewed first, until it fits (a degraded pin loses "
+                "its lock; its KV stays in the tree, evictable), and refuses "
+                "only if it cannot fit even then; 'refuse' refuses the new pin. "
+                "Only used with --enable-joint-checkpoint."
+            ),
+            choices=["lru", "refuse"],
+        ),
+    ] = "lru"
     jc_admit_first_max_tokens: A[
         int,
         "Joint checkpoint: the successors of truncated requests get a prefill step of their own (no other waiting request and no chunked-prefill chunk in it) while their appended tokens total at most this many; a larger successor only goes to the head of the waiting queue. <= 0 disables the exclusive step. Only used with --enable-joint-checkpoint.",

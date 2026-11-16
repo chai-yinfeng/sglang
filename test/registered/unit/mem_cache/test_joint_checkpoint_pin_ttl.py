@@ -149,13 +149,18 @@ class TestJointCheckpointPinTTL(CustomTestCase):
 
     # ------------------------------------------------------------ fixtures
 
-    def make_scheduler(self, enable=True, ttl_s=600.0, max_ratio=0.5) -> Scheduler:
+    def make_scheduler(
+        self, enable=True, ttl_s=600.0, max_ratio=0.5, overflow="refuse"
+    ) -> Scheduler:
         s = Scheduler.__new__(Scheduler)
         s.enable_joint_checkpoint = enable
         s.pin_table = {}
         s.jc_pin_ttl_s = ttl_s
         s.jc_pin_max_ttl_s = 3600.0
         s.jc_pin_max_ratio = max_ratio
+        s.jc_pin_overflow = overflow
+        s.jc_degraded_pins = {}
+        s.jc_pins_degraded_total = 0
         s.max_total_num_tokens = POOL_SIZE
         s.tree_cache = self.cache
         s.paused_reqs = {}

@@ -611,6 +611,12 @@ Please consult the documentation below and [server_args.py](https://github.com/s
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>float</td>
     </tr>
         <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--jc-pin-overflow`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Joint checkpoint: what a new pin does when `--jc-pin-max-ratio` would be exceeded. `lru` degrades other pins, least recently pinned or renewed first, until it fits (a degraded pin loses its lock; its KV stays in the tree, evictable), and refuses only if it cannot fit even then; `refuse` refuses the new pin. Only used with `--enable-joint-checkpoint`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`lru`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lru</code>, <code>refuse</code></td>
+    </tr>
+        <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--jc-admit-first-max-tokens`</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Joint checkpoint: the successors of truncated requests get a prefill step of their own (no other waiting request and no chunked-prefill chunk in it) while their appended tokens total at most this many; a larger successor only goes to the head of the waiting queue. `<= 0` disables the exclusive step. Only used with `--enable-joint-checkpoint`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`512`</td>
