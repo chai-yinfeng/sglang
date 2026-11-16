@@ -178,8 +178,8 @@ class PinOnFinishParams(msgspec.Struct, kw_only=True, array_like=True):
     carrying request finishes with its KV written to the radix tree (stop,
     length, or a plain abort; not a discard or a truncate cut), the scheduler
     holds that KV in the same step, as /pin_request on its rid would: same
-    pin_table record, TTL ``ttl_s`` (None uses --jc-pin-ttl-s; <= 0 never
-    expires) and --jc-pin-max-ratio cap. The outcome is reported in the final
+    pin_table record, TTL ``ttl_s`` (None uses --jc-pin-ttl-s; must be in
+    (0, --jc-pin-max-ttl-s]) and --jc-pin-max-ratio cap. The outcome is reported in the final
     chunk's meta_info as ``jc_pinned_len`` (and ``jc_pin_message`` when
     nothing was pinned)."""
 
@@ -2533,12 +2533,15 @@ class ConfigureLoggingReq(BaseReq, kw_only=True):
 
 class PinReqInput(BaseReq, kw_only=True):
     """Joint checkpoint: hold the running request ``rid``'s KV prefix
-    ``[0, up_to)`` in the radix tree until ``UnpinReqInput`` for the same rid.
-    The hold is independent of the request's lifetime, but expires after
-    ``ttl_s`` seconds (default ``--jc-pin-ttl-s``; <= 0 never expires).
-    Pinning the same rid again replaces the hold and restarts its TTL."""
+    ``[0, up_to)`` (None: all of its KV) in the radix tree until
+    ``UnpinReqInput`` for the same rid. The hold is independent of the
+    request's lifetime, but expires after ``ttl_s`` seconds (default
+    ``--jc-pin-ttl-s``; must be in (0, --jc-pin-max-ttl-s]). Pinning a running
+    rid again replaces the hold and restarts its TTL; pinning a rid that is no
+    longer running renews the TTL of its existing hold, whose coverage cannot
+    grow (``up_to`` past it is refused)."""
 
-    up_to: int
+    up_to: Optional[int] = None
     ttl_s: Optional[float] = None
 
 
@@ -2547,11 +2550,12 @@ class PinReqOutput(BaseReq, kw_only=True):
     # Tokens actually held (``up_to`` clamped to the request's KV and page-aligned).
     pinned_len: int = 0
     message: str = ""
-    # Seconds until the hold expires; None when it never expires.
+    # Seconds until the hold expires (None when nothing was held).
     expires_in_s: Optional[float] = None
-    # Sum of pinned_len over all holds after this call (shared prefixes counted
-    # once per hold).
+    # Distinct tree tokens held by all pins after this call (the cap's measure).
     pinned_tokens_total: int = 0
+    # Sum of pinned_len over all holds (a shared prefix once per hold); debug.
+    pinned_tokens_sum: int = 0
 
 
 class UnpinReqInput(BaseReq, kw_only=True):

@@ -555,6 +555,7 @@ POSITIONAL_FIELD_ORDER = (
     "enable_joint_checkpoint",
     "jc_pause_timeout_s",
     "jc_pin_ttl_s",
+    "jc_pin_max_ttl_s",
     "jc_pin_max_ratio",
     "jc_admit_first_max_tokens",
 )

@@ -3965,6 +3965,18 @@ class UnifiedRadixCache(BasePrefixCache):
     def path_device_indices(self, node: NodeId) -> torch.Tensor:
         return self.tree_core.collect_full_device_indices(node, self.root_node_handle())
 
+    def union_path_tokens(self, nodes: Sequence[NodeId]) -> int:
+        # Read off the current tree, so a split of a node on a path between
+        # two calls changes nothing: both halves stay on that path.
+        if self.disable or not nodes:
+            return 0
+        spans = {
+            info.node_id: info.path_end - info.path_start
+            for path in self.tree_core.collect_path_info(nodes)
+            for info in path
+        }
+        return sum(spans.values())
+
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
         return self.tree_core.root_node_handle(extra_key)

@@ -106,6 +106,19 @@ def check_watermark_server_args(server_args: Any) -> None:
         raise ValueError("--enable-watermark is not supported with SGLANG_RUST_SERVER")
 
 
+def check_joint_checkpoint_server_args(server_args: Any) -> None:
+    cfg = resolving_view(server_args)
+    if not cfg.enable_joint_checkpoint:
+        return
+    if not cfg.jc_pin_max_ttl_s > 0:
+        raise ValueError(f"--jc-pin-max-ttl-s must be > 0, got {cfg.jc_pin_max_ttl_s}")
+    if not 0 < cfg.jc_pin_ttl_s <= cfg.jc_pin_max_ttl_s:
+        raise ValueError(
+            f"--jc-pin-ttl-s must be in (0, --jc-pin-max-ttl-s "
+            f"{cfg.jc_pin_max_ttl_s}], got {cfg.jc_pin_ttl_s}"
+        )
+
+
 def validate_response_store(server_args: Any) -> None:
     cfg = resolving_view(server_args)
     if cfg.enable_response_store and cfg.disaggregation_mode != "null":
@@ -377,6 +390,8 @@ def check_server_args(server_args: Any):
         )
 
     check_watermark_server_args(server_args)
+
+    check_joint_checkpoint_server_args(server_args)
 
     check_load_publish_args(server_args)
 

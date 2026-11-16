@@ -101,11 +101,15 @@ class Memory(msgspec.Struct):
     ] = 300.0
     jc_pin_ttl_s: A[
         float,
-        "Joint checkpoint: a /pin_request hold is released this many seconds after it was taken (or last renewed by pinning the same rid again), unless the request sets its own ttl_s. <= 0 never expires. Only used with --enable-joint-checkpoint.",
+        "Joint checkpoint: a /pin_request hold is released this many seconds after it was taken (or last renewed by pinning the same rid again), unless the request sets its own ttl_s. Must be in (0, --jc-pin-max-ttl-s]. Only used with --enable-joint-checkpoint.",
     ] = 600.0
+    jc_pin_max_ttl_s: A[
+        float,
+        "Joint checkpoint: the longest TTL a pin may have; a /pin_request or jc_pin_on_finish ttl_s above it, or <= 0, is refused. Only used with --enable-joint-checkpoint.",
+    ] = 3600.0
     jc_pin_max_ratio: A[
         float,
-        "Joint checkpoint: /pin_request is refused when the pinned tokens (sum over holds, shared prefixes counted once per hold) would exceed this fraction of the KV pool. <= 0 disables the cap. Only used with --enable-joint-checkpoint.",
+        "Joint checkpoint: /pin_request is refused when the distinct tree tokens held by pins (a prefix shared by several holds counted once) would exceed this fraction of the KV pool. <= 0 disables the cap. Only used with --enable-joint-checkpoint.",
     ] = 0.5
     jc_admit_first_max_tokens: A[
         int,

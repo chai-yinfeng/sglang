@@ -105,7 +105,7 @@ message GenerateRequest {
 message PinOnFinishParams {
   option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
 
-  // Hold TTL in seconds (<= 0 never expires); absent uses --jc-pin-ttl-s.
+  // Hold TTL in seconds, in (0, --jc-pin-max-ttl-s]; absent uses --jc-pin-ttl-s.
   optional double ttl_s = 1;
 }
 

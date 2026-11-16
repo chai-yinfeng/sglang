@@ -560,6 +560,11 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
         the next allocation or eviction unless the path is locked."""
         raise NotImplementedError
 
+    def union_path_tokens(self, nodes: Sequence[Any]) -> int:
+        """Tokens on the union of the root-to-node paths of ``nodes``: a node
+        shared by several paths counts once."""
+        raise NotImplementedError
+
     def prefix_device_indices(self, req: Req) -> torch.Tensor:
         """KV indices of req's matched prefix, read off the path to its locked
         match node; valid from match until allocation writes them into the row."""

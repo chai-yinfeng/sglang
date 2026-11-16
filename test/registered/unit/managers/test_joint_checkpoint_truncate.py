@@ -26,8 +26,13 @@ real Req objects.
   jc_pin_on_finish gets, when release_kv_cache writes its KV into the tree,
   the hold /pin_request would make (pin_table record, TTL, cap), reported in
   its final chunk; discard and releases without a tree insert take none.
+  /pin_request on a finished rid renews that hold's lease.
+- Distinct accounting (TestJointCheckpointDistinctPinAccounting, Rust and
+  Python tree cores): the pin cap counts each tree token held by any pin
+  once, across node splits and in any release order.
 """
 
+import itertools
 import unittest
 from array import array
 from collections import deque
@@ -88,10 +93,15 @@ OUTPUT = list(range(200, 206))  # 6 generated tokens
 FILL = PROMPT + OUTPUT
 
 
-def make_cache(page_size: int = 1) -> UnifiedRadixCache:
+def make_cache(
+    page_size: int = 1,
+    pool_size: int = POOL_SIZE,
+    max_context_len: int = 128,
+    tree_core_backend=None,
+) -> UnifiedRadixCache:
     dtype = torch.float16
     kv_pool = MHATokenToKVPool(
-        size=POOL_SIZE,
+        size=pool_size,
         page_size=page_size,
         dtype=dtype,
         head_num=2,
@@ -102,7 +112,7 @@ def make_cache(page_size: int = 1) -> UnifiedRadixCache:
     )
     if page_size == 1:
         allocator = TokenToKVPoolAllocator(
-            size=POOL_SIZE,
+            size=pool_size,
             dtype=dtype,
             device="cpu",
             kvcache=kv_pool,
@@ -110,7 +120,7 @@ def make_cache(page_size: int = 1) -> UnifiedRadixCache:
         )
     else:
         allocator = PagedTokenToKVPoolAllocator(
-            size=POOL_SIZE,
+            size=pool_size,
             page_size=page_size,
             dtype=dtype,
             device="cpu",
@@ -118,7 +128,10 @@ def make_cache(page_size: int = 1) -> UnifiedRadixCache:
             need_sort=False,
         )
     req_pool = ReqToTokenPool(
-        size=8, max_context_len=128, device="cpu", enable_memory_saver=False
+        size=8,
+        max_context_len=max_context_len,
+        device="cpu",
+        enable_memory_saver=False,
     )
     return UnifiedRadixCache(
         CacheInitParams(
@@ -128,6 +141,7 @@ def make_cache(page_size: int = 1) -> UnifiedRadixCache:
             page_size=page_size,
             eviction_policy="lru",
             tree_components=(ComponentType.FULL,),
+            tree_core_backend=tree_core_backend,
         )
     )
 
@@ -152,13 +166,21 @@ def recv_for(rid, old_rid, pos, session_params=None):
 
 class _TruncateFixture(CustomTestCase):
     page_size = 1
+    pool_size = POOL_SIZE
+    max_context_len = 128
+    tree_core_backend = None  # the default (Rust when available)
 
     def setUp(self):
         super().setUp()
         reset_context()
         self.addCleanup(reset_context)
         publish(ServerArgs(model_path="dummy"), role="scheduler")
-        self.cache = make_cache(self.page_size)
+        self.cache = make_cache(
+            self.page_size,
+            pool_size=self.pool_size,
+            max_context_len=self.max_context_len,
+            tree_core_backend=self.tree_core_backend,
+        )
         self.allocator = self.cache.token_to_kv_pool_allocator
         self.now = 1000.0
         clock = SimpleNamespace(monotonic=lambda: self.now)
@@ -176,8 +198,9 @@ class _TruncateFixture(CustomTestCase):
         s.page_size = self.page_size
         s.pin_table = {}
         s.jc_pin_ttl_s = 600.0
+        s.jc_pin_max_ttl_s = 3600.0
         s.jc_pin_max_ratio = max_ratio
-        s.max_total_num_tokens = POOL_SIZE
+        s.max_total_num_tokens = self.pool_size
         s.paused_reqs = {}
         s.jc_pause_timeout_s = 1e9
         s.chunked_req = None
@@ -230,7 +253,7 @@ class _TruncateFixture(CustomTestCase):
         ).device_prefix_len
 
     def evict_all(self):
-        self.cache.evict(EvictParams(num_tokens=POOL_SIZE))
+        self.cache.evict(EvictParams(num_tokens=self.pool_size))
 
     def truncate(self, s, old_rid, pos, append=(900, 901), prefix=None, rid="succ"):
         """Run Scheduler._jc_truncate for a successor whose input is
@@ -894,8 +917,8 @@ class TestJointCheckpointPinOnFinish(_PinOnFinishFixture):
         self.assertEqual(old.jc_pin_outcome["jc_pinned_len"], 0)
         self.assertEqual(
             old.jc_pin_outcome["jc_pin_message"],
-            "pin cap exceeded: 16 tokens pinned by other holds + 16 for old > "
-            "limit 30 (--jc-pin-max-ratio 0.12 x 256)",
+            "pin cap exceeded: 32 distinct pinned tokens with this hold on old "
+            "(16 without it) > limit 30 (--jc-pin-max-ratio 0.12 x 256)",
         )
         self.evict_all()
         self.assertEqual(self.match_len(FILL), 12)
@@ -916,11 +939,11 @@ class TestJointCheckpointPinOnFinish(_PinOnFinishFixture):
     def test_ttl_expiry_and_unpin_release_the_hold(self):
         s = self.make_scheduler()
         short = self.armed(s, "short", ttl_s=5.0)
-        kept = self.armed(s, "kept", prompt=[p + 1000 for p in PROMPT], ttl_s=0)
+        kept = self.armed(s, "kept", prompt=[p + 1000 for p in PROMPT], ttl_s=3600)
         self.finish(short)
         self.finish(kept)
         self.assertEqual(s.pin_table["short"].expires_at, 1005.0)
-        self.assertIsNone(s.pin_table["kept"].expires_at)
+        self.assertEqual(s.pin_table["kept"].expires_at, 4600.0)
         self.now += 5
         s._jc_on_step(ScheduleBatch(reqs=[], batch_is_full=False))
         self.assertEqual(set(s.pin_table), {"kept"})
@@ -968,9 +991,68 @@ class TestJointCheckpointPinOnFinish(_PinOnFinishFixture):
         )
         self.assertIn("session_params", s._jc_arm_pin_on_finish(req, recv))
         recv.session_params = None
+        for ttl_s, needle in ((0, "ttl_s must be > 0"), (7200, "exceeds")):
+            recv.jc_pin_on_finish = PinOnFinishParams(ttl_s=ttl_s)
+            self.assertIn(needle, s._jc_arm_pin_on_finish(req, recv))
+        recv.jc_pin_on_finish = PinOnFinishParams()
         req.skip_radix_cache_insert = True
         self.assertIn("barred", s._jc_arm_pin_on_finish(req, recv))
         self.assertIsNone(req.jc_finish_hold)
+
+    def test_pin_request_renews_a_finished_hold(self):
+        """A rid that is no longer running renews its hold's lease; coverage
+        can shrink nothing and grow nothing."""
+        s = self.make_scheduler()
+        old = self.armed(s, "old")
+        self.finish(old)
+        s.running_batch.filter_batch()
+        pin = s.pin_table["old"]
+        self.now = 1500.0
+        out = s.pin_request(PinReqInput(rid="old", ttl_s=100.0))
+        self.assertTrue(out.success, out.message)
+        self.assertEqual((out.pinned_len, out.expires_in_s), (len(FILL), 100.0))
+        self.assertEqual((pin.pinned_at, pin.expires_at), (1500.0, 1600.0))
+        out = s.pin_request(PinReqInput(rid="old", up_to=len(FILL) + 1))
+        self.assertFalse(out.success)
+        self.assertIn("cannot be extended to 17", out.message)
+        self.assertEqual(pin.expires_at, 1600.0)
+        out = s.pin_request(PinReqInput(rid="old", up_to=10))
+        self.assertTrue(out.success)
+        self.assertEqual(out.pinned_len, len(FILL))
+        self.assertEqual(pin.expires_at, 2100.0)
+        self.assertIs(s.pin_table["old"], pin)
+        # One lock throughout: unpin leaves nothing held.
+        s.unpin_request(UnpinReqInput(rid="old"))
+        self.evict_all()
+        self.assertEqual(self.allocator.available_size(), POOL_SIZE)
+
+    def test_renewal_refused_for_truncate_holds_expired_pins_and_bad_ttl(self):
+        s = self.make_scheduler()
+        old = self.armed(s, "old")
+        self.finish(old)
+        s.running_batch.filter_batch()
+        _, err = self.truncate(s, "old", 12)
+        self.assertIsNone(err)
+        out = s.pin_request(PinReqInput(rid="succ"))
+        self.assertEqual(out.message, "request succ is not running")
+        out = s.pin_request(PinReqInput(rid="old", ttl_s=0))
+        self.assertEqual(out.message, "ttl_s must be > 0, got 0")
+        # Expired, not yet released by the next step: gone for renewal too.
+        self.now = s.pin_table["old"].expires_at
+        out = s.pin_request(PinReqInput(rid="old"))
+        self.assertEqual(out.message, "request old is not running")
+
+    def test_truncate_hold_and_client_pin_on_one_path_count_once(self):
+        # limit int(0.08 x 256) = 20: the successor hold of 16 on the path the
+        # client pin already holds adds nothing, so it fits.
+        old = self.start("old", PROMPT, OUTPUT)
+        s = self.make_scheduler([old], max_ratio=0.08)
+        self.assertTrue(s.pin_request(PinReqInput(rid="old", up_to=16)).success)
+        _, err = self.truncate(s, "old", len(FILL), prefix=FILL, append=(900,))
+        self.assertIsNone(err)
+        self.assertEqual(s.pin_table["succ"].pinned_len, len(FILL))
+        self.assertEqual(s._jc_pinned_tokens_total(), len(FILL))
+        self.assertEqual(s._jc_pinned_tokens_sum(), 2 * len(FILL))
 
 
 class TestJointCheckpointPinOnFinishPaged(_PinOnFinishFixture):
@@ -1009,6 +1091,81 @@ class TestJointCheckpointPinOnFinishWire(CustomTestCase):
             obj.normalize_batch_and_arguments()
         obj = GenerateReqInput(input_ids=[1, 2], jc_pin_on_finish={"ttl_s": None})
         obj.normalize_batch_and_arguments()
+
+
+PREFIX_LEN, TAIL_LEN = 4300, 3700
+SHARED_PREFIX = list(range(10_000, 10_000 + PREFIX_LEN))
+
+
+def session_prompt(i):
+    """The shared prefix and session i's own tail, less the one output token."""
+    start = 100_000 * (i + 1)
+    return SHARED_PREFIX + list(range(start, start + TAIL_LEN - 1))
+
+
+class TestJointCheckpointDistinctPinAccounting(_PinOnFinishFixture):
+    """The pin cap counts the distinct tree tokens held by any pin: a prefix
+    shared by several holds counts once, read off the tree so a node split
+    under a held path changes nothing."""
+
+    pool_size = 32768
+    max_context_len = 8192
+
+    def hold(self, s, i):
+        req = self.armed(s, f"r{i}", prompt=session_prompt(i), outputs=[7])
+        self.finish(req)
+        return req
+
+    def test_shared_prefix_counted_once_across_a_split(self):
+        s = self.make_scheduler()
+        self.hold(s, 0)
+        self.assertEqual(s._jc_pinned_tokens_total(), 8000)
+        # Admitting r1 matches the shared prefix and splits r0's node there.
+        r1 = self.armed(s, "r1", prompt=session_prompt(1), outputs=[7])
+        self.assertEqual(r1.prefix_len, PREFIX_LEN)
+        self.assertEqual(s._jc_pinned_tokens_total(), 8000)
+        self.finish(r1)
+        self.assertEqual(s._jc_pinned_tokens_total(), PREFIX_LEN + 2 * TAIL_LEN)
+        self.hold(s, 2)
+        out = s.pin_request(PinReqInput(rid="r2"))
+        self.assertTrue(out.success, out.message)
+        self.assertEqual(out.pinned_tokens_total, PREFIX_LEN + 3 * TAIL_LEN)
+        self.assertEqual(out.pinned_tokens_sum, 3 * 8000)
+
+    def test_release_in_any_order_returns_to_zero(self):
+        for order in itertools.permutations(range(3)):
+            with self.subTest(order=order):
+                self.setUp()
+                s = self.make_scheduler()
+                for i in range(3):
+                    self.hold(s, i)
+                for k, i in enumerate(order):
+                    s.unpin_request(UnpinReqInput(rid=f"r{i}"))
+                    left = 2 - k
+                    want = PREFIX_LEN + left * TAIL_LEN if left else 0
+                    self.assertEqual(s._jc_pinned_tokens_total(), want)
+                self.evict_all()
+                self.assertEqual(self.allocator.available_size(), self.pool_size)
+
+    def test_cap_refusal_uses_the_distinct_count(self):
+        # limit 16384: three holds (24000 summed, 15400 distinct) fit; a
+        # fourth tail does not.
+        s = self.make_scheduler(max_ratio=0.5)
+        for i in range(3):
+            self.assertEqual(self.hold(s, i).jc_pin_outcome, {"jc_pinned_len": 8000})
+        fourth = self.hold(s, 3)
+        self.assertEqual(
+            fourth.jc_pin_outcome["jc_pin_message"],
+            "pin cap exceeded: 19100 distinct pinned tokens with this hold on r3 "
+            "(15400 without it) > limit 16384 (--jc-pin-max-ratio 0.5 x 32768)",
+        )
+        self.assertEqual(set(s.pin_table), {"r0", "r1", "r2"})
+
+
+class TestJointCheckpointDistinctPinAccountingPythonCore(
+    TestJointCheckpointDistinctPinAccounting
+):
+    tree_core_backend = "python"
 
 
 # ---------------------------------------------------------------- exclusive admission

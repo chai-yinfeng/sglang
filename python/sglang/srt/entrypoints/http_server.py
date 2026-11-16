@@ -1742,7 +1742,8 @@ async def abort_request(obj: Annotated[AbortReq, Body()], request: Request):
 async def pin_request(obj: Annotated[PinReqInput, Body()], request: Request):
     """Joint checkpoint: hold a running request's KV prefix [0, up_to) in the
     radix tree until /unpin_request or its TTL (ttl_s, default --jc-pin-ttl-s)
-    runs out (needs --enable-joint-checkpoint)."""
+    runs out; for a rid no longer running, renew its hold's TTL (needs
+    --enable-joint-checkpoint)."""
     result = await _global_state.tokenizer_manager.pin_request(obj)
     status_code = HTTPStatus.OK if result.success else HTTPStatus.BAD_REQUEST
     return ORJSONResponse(msgspec_to_builtins(result), status_code=status_code)

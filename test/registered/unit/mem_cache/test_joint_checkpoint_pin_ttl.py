@@ -4,7 +4,8 @@ Scheduler.__new__ over a real UnifiedRadixCache:
 - a pin expires after --jc-pin-ttl-s (or its own ttl_s) at the next
   scheduling step (Scheduler._jc_on_step), even under speculative decoding
   where pause/resume is skipped; re-pinning the same rid restarts the TTL;
-- pins are refused once their total would exceed
+  a TTL <= 0 or past --jc-pin-max-ttl-s is refused;
+- pins are refused once the distinct tokens they hold would exceed
   --jc-pin-max-ratio x max_total_num_tokens, judged after replacing the
   rid's own earlier hold;
 - flush_cache (and the PD role switch reset) drop the pin table with the tree;
@@ -13,6 +14,7 @@ Scheduler.__new__ over a real UnifiedRadixCache:
 The clock is the scheduler module's ``time`` replaced by a settable stub.
 """
 
+from sglang.srt.arg_groups.validation_hook import check_joint_checkpoint_server_args
 from sglang.srt.runtime_context import publish, reset_context
 from sglang.srt.server_args import ServerArgs
 from sglang.test.ci.ci_register import register_cpu_ci
@@ -152,6 +154,7 @@ class TestJointCheckpointPinTTL(CustomTestCase):
         s.enable_joint_checkpoint = enable
         s.pin_table = {}
         s.jc_pin_ttl_s = ttl_s
+        s.jc_pin_max_ttl_s = 3600.0
         s.jc_pin_max_ratio = max_ratio
         s.max_total_num_tokens = POOL_SIZE
         s.tree_cache = self.cache
@@ -249,27 +252,44 @@ class TestJointCheckpointPinTTL(CustomTestCase):
     def test_request_ttl_overrides_default(self):
         s = self.make_scheduler()
         self.add_req("short", 100)
-        self.add_req("forever", 200)
+        self.add_req("long", 200)
         out = self.pin(s, "short", 5, ttl_s=5.0)
         self.assertEqual(out.expires_in_s, 5.0)
-        out = self.pin(s, "forever", 5, ttl_s=0)
-        self.assertIsNone(out.expires_in_s)
+        out = self.pin(s, "long", 5, ttl_s=3600.0)
+        self.assertEqual(out.expires_in_s, 3600.0)
 
         self.now = 1005.0
         self.step(s)
-        self.assertEqual(set(s.pin_table), {"forever"})
-        self.now = 1e9
+        self.assertEqual(set(s.pin_table), {"long"})
+        self.now = 4600.0
         self.step(s)
-        self.assertEqual(set(s.pin_table), {"forever"})
+        self.assertEqual(s.pin_table, {})
 
-    def test_ttl_flag_zero_never_expires(self):
-        s = self.make_scheduler(ttl_s=0.0)
+    def test_ttl_must_be_positive_and_bounded(self):
+        """No hold lives forever: ttl_s <= 0 or past --jc-pin-max-ttl-s is
+        refused without touching the tree, and so is such a server default."""
+        s = self.make_scheduler()
         self.add_req("a", 100)
-        out = self.pin(s, "a", 5)
-        self.assertIsNone(out.expires_in_s)
-        self.now = 1e9
-        self.step(s)
-        self.assertIn("a", s.pin_table)
+        for ttl_s, needle in (
+            (0, "ttl_s must be > 0, got 0"),
+            (-1.0, "ttl_s must be > 0, got -1.0"),
+            (3600.5, "ttl_s 3600.5 exceeds --jc-pin-max-ttl-s 3600.0"),
+        ):
+            out = self.pin(s, "a", 5, ttl_s=ttl_s)
+            self.assertFalse(out.success)
+            self.assertEqual(out.message, needle)
+        self.assertEqual(s.pin_table, {})
+        self.assertEqual(self.reqs["a"].kv.cache_protected_len, 0)
+        for ttl, max_ttl in ((0.0, 3600.0), (601.0, 600.0), (600.0, 0.0)):
+            args = ServerArgs(
+                model_path="dummy",
+                enable_joint_checkpoint=True,
+                jc_pin_ttl_s=ttl,
+                jc_pin_max_ttl_s=max_ttl,
+            )
+            with self.assertRaises(ValueError, msg=(ttl, max_ttl)):
+                check_joint_checkpoint_server_args(args)
+        check_joint_checkpoint_server_args(ServerArgs(model_path="dummy"))
 
     def test_expiry_runs_under_speculative_decoding(self):
         s = self.make_scheduler()
@@ -319,7 +339,10 @@ class TestJointCheckpointPinTTL(CustomTestCase):
         out = self.pin(s, "b", 13)
         self.assertFalse(out.success)
         self.assertIn("pin cap exceeded", out.message)
-        self.assertIn("20 tokens pinned by other holds + 13 for b > limit 32", out.message)
+        self.assertIn(
+            "33 distinct pinned tokens with this hold on b (20 without it) > limit 32",
+            out.message,
+        )
         self.assertEqual(out.pinned_tokens_total, 20)
         self.assertNotIn("b", s.pin_table)
         # The refused pin touched nothing: b's KV is still its own.

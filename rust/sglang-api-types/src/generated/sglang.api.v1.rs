@@ -450,7 +450,7 @@ pub struct GenerateRequest {
 /// Joint checkpoint pin-on-finish options.
 #[derive(Clone, Copy, PartialEq, ::prost::Message)]
 pub struct PinOnFinishParams {
-    /// Hold TTL in seconds (\<= 0 never expires); absent uses --jc-pin-ttl-s.
+    /// Hold TTL in seconds, in (0, --jc-pin-max-ttl-s\]; absent uses --jc-pin-ttl-s.
     #[prost(double, optional, tag = "1")]
     pub ttl_s: ::core::option::Option<f64>,
 }

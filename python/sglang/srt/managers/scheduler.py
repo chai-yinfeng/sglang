@@ -443,8 +443,8 @@ class JcPin:
     pinned_len: int
     # time.monotonic() when taken or last renewed.
     pinned_at: float
-    # time.monotonic() deadline; None never expires.
-    expires_at: Optional[float]
+    # time.monotonic() deadline; every hold expires.
+    expires_at: float
     # Truncate hold: the rid of the request that was cut. Released once the
     # keyed request is admitted (it then holds the prefix itself) or aborted.
     successor_of: Optional[str] = None
@@ -559,6 +559,7 @@ class Scheduler(
         # scheduling step) or flush_cache releases it.
         self.pin_table: Dict[str, JcPin] = {}
         self.jc_pin_ttl_s = get_memory().jc_pin_ttl_s
+        self.jc_pin_max_ttl_s = get_memory().jc_pin_max_ttl_s
         self.jc_pin_max_ratio = get_memory().jc_pin_max_ratio
         # Joint checkpoint P5: rid -> request taken out of the decode batch by
         # pause_request or its lookahead budget. Not in waiting_queue or
@@ -6360,7 +6361,7 @@ class Scheduler(
         if (
             pin is None
             or pin.successor_of is not None
-            or (pin.expires_at is not None and time.monotonic() >= pin.expires_at)
+            or time.monotonic() >= pin.expires_at
             or pin.pinned_len < covered
         ):
             return f"request {old_rid} is not running and no pin covers position {pos}"
@@ -6472,20 +6473,14 @@ class Scheduler(
         if kept <= 0 or old.last_node is None:
             return
         prev = self.pin_table.get(successor_rid)
-        if self.jc_pin_max_ratio > 0:
-            others = self._jc_pinned_tokens_total() - (
-                prev.pinned_len if prev is not None else 0
+        refusal = self._jc_pin_cap_refusal(rid=successor_rid, node=old.last_node)
+        if refusal is not None:
+            logger.info(
+                f"joint-checkpoint: truncate of rid={old.rid} takes no hold "
+                f"for successor rid={successor_rid}: {refusal}; the successor "
+                f"locks the prefix when admitted"
             )
-            limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
-            if others + kept > limit:
-                logger.info(
-                    f"joint-checkpoint: truncate of rid={old.rid} takes no hold "
-                    f"for successor rid={successor_rid}: {others} tokens pinned "
-                    f"+ {kept} > limit {limit} (--jc-pin-max-ratio "
-                    f"{self.jc_pin_max_ratio}); the successor locks the prefix "
-                    f"when admitted"
-                )
-                return
+            return
         lock = self.tree_cache.lock(old.last_node)
         if lock is None:
             return
@@ -6618,15 +6613,20 @@ class Scheduler(
     def pin_request(self, recv_req: PinReqInput):
         """Joint checkpoint P1: insert the running request's KV prefix
         [0, up_to) into the tree and hold it with a lock the request does not
-        own, so it stays resident after the request finishes or is aborted."""
+        own, so it stays resident after the request finishes or is aborted.
+        For a rid that is no longer running but still holds a pin (client
+        pin or pin-on-finish hold), renew that lease instead."""
         if not self.enable_joint_checkpoint:
             return PinReqOutput(
                 success=False, message="--enable-joint-checkpoint is not set"
             )
         rid = recv_req.rid
+        ttl_s = recv_req.ttl_s if recv_req.ttl_s is not None else self.jc_pin_ttl_s
+        if (refusal := self._jc_ttl_refusal(ttl_s)) is not None:
+            return PinReqOutput(success=False, message=refusal)
         req = self._find_inflight_req(rid)
         if req is None or req.finished() or not req.kv.holds_kv:
-            return PinReqOutput(success=False, message=f"request {rid} is not running")
+            return self._jc_renew_pin(rid=rid, up_to=recv_req.up_to, ttl_s=ttl_s)
         if req.session is not None and req.session.streaming:
             # A streaming-session turn's tree lock belongs to the session slot.
             return PinReqOutput(
@@ -6638,19 +6638,22 @@ class Scheduler(
             )
         # Same clamp as release_kv_cache: only KV the request owns can be keyed.
         req.refresh_fill_ids()
-        up_to = min(
-            recv_req.up_to, req.owned_kv_len(), len(req.full_untruncated_fill_ids)
-        )
-        # Checked before anything touches the tree: the hold will cover at
-        # most max(up_to, cache_protected_len) tokens (checkpoint page-aligns down).
+        up_to = min(req.owned_kv_len(), len(req.full_untruncated_fill_ids))
+        if recv_req.up_to is not None:
+            up_to = min(up_to, recv_req.up_to)
+        # Checked before anything touches the tree: the hold will cover the
+        # path to last_node plus at most the tokens checkpoint adds past it.
         refusal = self._jc_pin_cap_refusal(
-            rid=rid, pin_len=max(up_to, req.kv.cache_protected_len)
+            rid=rid,
+            node=req.last_node,
+            extra_tokens=max(up_to - req.kv.cache_protected_len, 0),
         )
         if refusal is not None:
             return PinReqOutput(
                 success=False,
                 message=refusal,
                 pinned_tokens_total=self._jc_pinned_tokens_total(),
+                pinned_tokens_sum=self._jc_pinned_tokens_sum(),
             )
         if up_to > req.kv.cache_protected_len:
             # checkpoint page-aligns the insert and moves req.lock / req.last_node
@@ -6659,53 +6662,99 @@ class Scheduler(
         # [0, cache_protected_len) is already in the tree, ending at last_node;
         # a shorter up_to is covered by holding that node.
         pinned_len = req.kv.cache_protected_len
-        ttl_s = recv_req.ttl_s if recv_req.ttl_s is not None else self.jc_pin_ttl_s
         if not self._jc_take_hold(
             rid=rid, node=req.last_node, pinned_len=pinned_len, ttl_s=ttl_s
         ):
             return PinReqOutput(
                 success=False, pinned_len=0, message="tree did not hand out a lock"
             )
-        expires_in_s = ttl_s if ttl_s > 0 else None
-        pinned_tokens_total = self._jc_pinned_tokens_total()
+        out = self._jc_pin_output(pinned_len=pinned_len, ttl_s=ttl_s)
         logger.info(
             f"joint-checkpoint: pinned rid={rid} len={pinned_len} "
-            f"(requested up_to={recv_req.up_to}) expires_in_s={expires_in_s} "
-            f"pinned_tokens_total={pinned_tokens_total}"
+            f"(requested up_to={recv_req.up_to}) expires_in_s={ttl_s} "
+            f"pinned_tokens_total={out.pinned_tokens_total} "
+            f"pinned_tokens_sum={out.pinned_tokens_sum}"
         )
+        return out
+
+    def _jc_renew_pin(
+        self, *, rid: str, up_to: Optional[int], ttl_s: float
+    ) -> PinReqOutput:
+        """/pin_request on a rid that is not running: restart the TTL of its
+        unexpired client pin or pin-on-finish hold (not a truncate hold).
+        Coverage stays as it is; an ``up_to`` past it is refused, since the
+        finished request's KV past the hold is gone."""
+        pin = self.pin_table.get(rid)
+        if (
+            pin is None
+            or pin.successor_of is not None
+            or time.monotonic() >= pin.expires_at
+        ):
+            return PinReqOutput(success=False, message=f"request {rid} is not running")
+        if up_to is not None and up_to > pin.pinned_len:
+            return PinReqOutput(
+                success=False,
+                pinned_len=pin.pinned_len,
+                message=(
+                    f"request {rid} is not running; its pin covers "
+                    f"{pin.pinned_len} tokens and cannot be extended to {up_to}"
+                ),
+            )
+        now = time.monotonic()
+        pin.pinned_at = now
+        pin.expires_at = now + ttl_s
+        logger.info(
+            f"joint-checkpoint: renewed pin rid={rid} len={pin.pinned_len} "
+            f"expires_in_s={ttl_s}"
+        )
+        return self._jc_pin_output(pinned_len=pin.pinned_len, ttl_s=ttl_s)
+
+    def _jc_pin_output(self, *, pinned_len: int, ttl_s: float) -> PinReqOutput:
         return PinReqOutput(
             success=True,
             pinned_len=pinned_len,
-            expires_in_s=expires_in_s,
-            pinned_tokens_total=pinned_tokens_total,
+            expires_in_s=ttl_s,
+            pinned_tokens_total=self._jc_pinned_tokens_total(),
+            pinned_tokens_sum=self._jc_pinned_tokens_sum(),
         )
 
-    def _jc_pin_cap_refusal(self, *, rid: str, pin_len: int) -> Optional[str]:
-        """The --jc-pin-max-ratio refusal for a hold of ``pin_len`` tokens on
-        ``rid``, or None. Judged on the total after replacing the rid's own
-        earlier hold; the total sums pinned_len over holds, so a prefix shared
-        by several holds is counted once per hold (a conservative over-estimate
-        of the KV that pins keep out of eviction)."""
+    def _jc_ttl_refusal(self, ttl_s: float) -> Optional[str]:
+        """Every hold expires: ``ttl_s`` must be in (0, --jc-pin-max-ttl-s]."""
+        if not ttl_s > 0:
+            return f"ttl_s must be > 0, got {ttl_s}"
+        if ttl_s > self.jc_pin_max_ttl_s:
+            return f"ttl_s {ttl_s} exceeds --jc-pin-max-ttl-s {self.jc_pin_max_ttl_s}"
+        return None
+
+    def _jc_pin_cap_refusal(
+        self, *, rid: str, node: Any, extra_tokens: int = 0
+    ) -> Optional[str]:
+        """The --jc-pin-max-ratio refusal for a hold of ``rid`` on the path to
+        ``node`` (plus ``extra_tokens`` past it), or None. Judged on the
+        distinct tree tokens all pins would hold, after replacing the rid's
+        own earlier hold: a prefix shared by several holds counts once."""
         if self.jc_pin_max_ratio <= 0:
             return None
-        prev = self.pin_table.get(rid)
-        others = self._jc_pinned_tokens_total() - (
-            prev.pinned_len if prev is not None else 0
+        projected = (
+            self._jc_pinned_tokens_total(exclude_rid=rid, extra_node=node)
+            + extra_tokens
         )
         limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
-        if others + pin_len <= limit:
+        if projected <= limit:
             return None
+        others = self._jc_pinned_tokens_total(exclude_rid=rid)
         return (
-            f"pin cap exceeded: {others} tokens pinned by other holds + "
-            f"{pin_len} for {rid} > limit {limit} (--jc-pin-max-ratio "
-            f"{self.jc_pin_max_ratio} x {self.max_total_num_tokens})"
+            f"pin cap exceeded: {projected} distinct pinned tokens with this hold "
+            f"on {rid} ({others} without it) > limit {limit} "
+            f"(--jc-pin-max-ratio {self.jc_pin_max_ratio} x "
+            f"{self.max_total_num_tokens})"
         )
 
     def _jc_take_hold(
         self, *, rid: str, node: Any, pinned_len: int, ttl_s: float
     ) -> bool:
         """Lock ``node`` (ending [0, pinned_len) in the tree) as the pin of
-        ``rid`` for ``ttl_s`` seconds (<= 0 never expires). An earlier hold of
+        ``rid`` for ``ttl_s`` seconds. An earlier hold of
         the rid is replaced and unlocked, restarting the TTL. False, with
         nothing changed, when the tree hands out no lock."""
         new_lock = self.tree_cache.lock(node)
@@ -6717,7 +6766,7 @@ class Scheduler(
             lock=new_lock,
             pinned_len=pinned_len,
             pinned_at=now,
-            expires_at=now + ttl_s if ttl_s > 0 else None,
+            expires_at=now + ttl_s,
         )
         if old_pin is not None:
             self.tree_cache.unlock(old_pin.lock)
@@ -6746,7 +6795,10 @@ class Scheduler(
             return "jc_pin_on_finish is not supported with PD disaggregation or dLLM"
         if req.skip_radix_cache_insert:
             return "jc_pin_on_finish: request is barred from the radix tree"
-        req.jc_pin_ttl_s = recv_req.jc_pin_on_finish.ttl_s
+        ttl_s = recv_req.jc_pin_on_finish.ttl_s
+        if ttl_s is not None and (refusal := self._jc_ttl_refusal(ttl_s)) is not None:
+            return f"jc_pin_on_finish: {refusal}"
+        req.jc_pin_ttl_s = ttl_s
         req.jc_finish_hold = self._jc_hold_on_finish
         # Replaced by _jc_hold_on_finish; stays when the request finishes
         # without a tree insert (discard, truncate cut, chunked-prefill abort).
@@ -6768,7 +6820,7 @@ class Scheduler(
         if pinned_len <= 0:
             refusal = "no KV of the request is in the radix tree"
         else:
-            refusal = self._jc_pin_cap_refusal(rid=req.rid, pin_len=pinned_len)
+            refusal = self._jc_pin_cap_refusal(rid=req.rid, node=req.last_node)
         if refusal is None and not self._jc_take_hold(
             rid=req.rid, node=req.last_node, pinned_len=pinned_len, ttl_s=ttl_s
         ):
@@ -6782,7 +6834,7 @@ class Scheduler(
         req.jc_pin_outcome = {"jc_pinned_len": pinned_len}
         logger.info(
             f"joint-checkpoint: pinned on finish rid={req.rid} len={pinned_len} "
-            f"expires_in_s={ttl_s if ttl_s > 0 else None} "
+            f"expires_in_s={ttl_s} "
             f"pinned_tokens_total={self._jc_pinned_tokens_total()}"
         )
 
@@ -6803,9 +6855,21 @@ class Scheduler(
         logger.info(f"joint-checkpoint: unpinned rid={recv_req.rid}")
         return UnpinReqOutput(success=True)
 
-    def _jc_pinned_tokens_total(self) -> int:
-        """Sum of pinned_len over the holds; a prefix shared by several holds
-        is counted once per hold."""
+    def _jc_pinned_tokens_total(
+        self, *, exclude_rid: Optional[str] = None, extra_node: Any = None
+    ) -> int:
+        """Distinct tree tokens the holds keep (the union of their root-to-node
+        paths, recomputed from the tree), without ``exclude_rid``'s hold and
+        with a path to ``extra_node`` added."""
+        nodes = [
+            pin.lock.node for rid, pin in self.pin_table.items() if rid != exclude_rid
+        ]
+        if extra_node is not None:
+            nodes.append(extra_node)
+        return self.tree_cache.union_path_tokens(nodes)
+
+    def _jc_pinned_tokens_sum(self) -> int:
+        """Sum of pinned_len over the holds (a shared prefix once per hold)."""
         return sum(pin.pinned_len for pin in self.pin_table.values())
 
     def _jc_expire_pins(self) -> None:
@@ -6813,11 +6877,7 @@ class Scheduler(
         if not self.pin_table:
             return
         now = time.monotonic()
-        expired = [
-            rid
-            for rid, pin in self.pin_table.items()
-            if pin.expires_at is not None and now >= pin.expires_at
-        ]
+        expired = [rid for rid, pin in self.pin_table.items() if now >= pin.expires_at]
         for rid in expired:
             pin = self.pin_table.pop(rid)
             self.tree_cache.unlock(pin.lock)
