@@ -1684,6 +1684,9 @@ impl ::serde::Serialize for GenerateRequest {
         if let Some(v) = &self.truncate {
             ::serde::ser::SerializeMap::serialize_entry(&mut map, "truncate", v)?;
         }
+        if let Some(v) = &self.jc_pin_on_finish {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "jc_pin_on_finish", v)?;
+        }
         ::serde::ser::SerializeMap::end(map)
     }
 }
@@ -1740,6 +1743,7 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                 let mut f_return_sampling_mask = None;
                 let mut f_modalities = None;
                 let mut f_truncate = None;
+                let mut f_jc_pin_on_finish = None;
                 while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
                     match key.as_ref() {
                         "rid" => {
@@ -2030,6 +2034,15 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                             }
                             f_truncate = Some(map.next_value::<Option<TruncateParams>>()?);
                         }
+                        "jc_pin_on_finish" => {
+                            if f_jc_pin_on_finish.is_some() {
+                                return Err(::serde::de::Error::duplicate_field(
+                                    "jc_pin_on_finish",
+                                ));
+                            }
+                            f_jc_pin_on_finish =
+                                Some(map.next_value::<Option<PinOnFinishParams>>()?);
+                        }
                         _ => {
                             map.next_value::<::serde::de::IgnoredAny>()?;
                         }
@@ -2076,6 +2089,53 @@ impl<'de> ::serde::Deserialize<'de> for GenerateRequest {
                     return_sampling_mask: f_return_sampling_mask.flatten(),
                     modalities: f_modalities.flatten(),
                     truncate: f_truncate.flatten(),
+                    jc_pin_on_finish: f_jc_pin_on_finish.flatten(),
+                })
+            }
+        }
+        deserializer.deserialize_map(V)
+    }
+}
+
+impl ::serde::Serialize for PinOnFinishParams {
+    fn serialize<S: ::serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        let mut map = serializer.serialize_map(None)?;
+        if let Some(v) = &self.ttl_s {
+            ::serde::ser::SerializeMap::serialize_entry(&mut map, "ttl_s", v)?;
+        }
+        ::serde::ser::SerializeMap::end(map)
+    }
+}
+
+impl<'de> ::serde::Deserialize<'de> for PinOnFinishParams {
+    fn deserialize<D: ::serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        const FIELDS: &[&str] = &["ttl_s"];
+        struct V;
+        impl<'de> ::serde::de::Visitor<'de> for V {
+            type Value = PinOnFinishParams;
+            fn expecting(&self, f: &mut ::core::fmt::Formatter) -> ::core::fmt::Result {
+                f.write_str("struct PinOnFinishParams")
+            }
+            fn visit_map<A: ::serde::de::MapAccess<'de>>(
+                self,
+                mut map: A,
+            ) -> Result<Self::Value, A::Error> {
+                let mut f_ttl_s = None;
+                while let Some(key) = map.next_key::<::std::borrow::Cow<'_, str>>()? {
+                    match key.as_ref() {
+                        "ttl_s" => {
+                            if f_ttl_s.is_some() {
+                                return Err(::serde::de::Error::duplicate_field("ttl_s"));
+                            }
+                            f_ttl_s = Some(map.next_value::<Option<f64>>()?);
+                        }
+                        other => {
+                            return Err(::serde::de::Error::unknown_field(other, FIELDS));
+                        }
+                    }
+                }
+                Ok(PinOnFinishParams {
+                    ttl_s: f_ttl_s.flatten(),
                 })
             }
         }

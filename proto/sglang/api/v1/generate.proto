@@ -93,6 +93,20 @@ message GenerateRequest {
   // request `rid` from absolute position `pos`: its input_ids start with that
   // request's first `pos` tokens.
   TruncateParams truncate = 41;
+
+  // Joint checkpoint pin-on-finish (Python server; the Rust server rejects a
+  // non-null value). Present (even `{}`): when this request finishes with its
+  // KV written to the radix tree, the scheduler holds that KV like a
+  // /pin_request on this rid would.
+  PinOnFinishParams jc_pin_on_finish = 42;
+}
+
+// Joint checkpoint pin-on-finish options.
+message PinOnFinishParams {
+  option (sglang.json.v1.message_json).unknown_fields = UNKNOWN_FIELDS_DENY;
+
+  // Hold TTL in seconds (<= 0 never expires); absent uses --jc-pin-ttl-s.
+  optional double ttl_s = 1;
 }
 
 // Joint checkpoint truncate target: the request to cut and the absolute token

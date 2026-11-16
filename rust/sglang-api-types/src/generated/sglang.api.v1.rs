@@ -440,6 +440,19 @@ pub struct GenerateRequest {
     /// request's first `pos` tokens.
     #[prost(message, optional, tag = "41")]
     pub truncate: ::core::option::Option<TruncateParams>,
+    /// Joint checkpoint pin-on-finish (Python server; the Rust server rejects a
+    /// non-null value). Present (even `{}`): when this request finishes with its
+    /// KV written to the radix tree, the scheduler holds that KV like a
+    /// /pin_request on this rid would.
+    #[prost(message, optional, tag = "42")]
+    pub jc_pin_on_finish: ::core::option::Option<PinOnFinishParams>,
+}
+/// Joint checkpoint pin-on-finish options.
+#[derive(Clone, Copy, PartialEq, ::prost::Message)]
+pub struct PinOnFinishParams {
+    /// Hold TTL in seconds (\<= 0 never expires); absent uses --jc-pin-ttl-s.
+    #[prost(double, optional, tag = "1")]
+    pub ttl_s: ::core::option::Option<f64>,
 }
 /// Joint checkpoint truncate target: the request to cut and the absolute token
 /// position (into its prompt + output) to cut it at.

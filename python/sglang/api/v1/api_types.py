@@ -277,6 +277,7 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     return_sampling_mask: Optional[BoolOrList] = None
     modalities: Optional[OptionalStringList] = None
     truncate: Optional[TruncateParams] = None
+    jc_pin_on_finish: Optional[PinOnFinishParams] = None
 
     @classmethod
     def from_json_value(cls, value: Any) -> "GenerateRequest":
@@ -286,6 +287,21 @@ class GenerateRequest(msgspec.Struct, kw_only=True, frozen=True):
     def to_json_value(self) -> Dict[str, Any]:
         """Encode to a JSON-ready value (json.dumps-compatible)."""
         return encode_GenerateRequest(self)
+
+
+class PinOnFinishParams(msgspec.Struct, kw_only=True, frozen=True):
+    """sglang.api.v1.PinOnFinishParams: JSON object (unknown keys rejected)."""
+
+    ttl_s: Optional[float] = None
+
+    @classmethod
+    def from_json_value(cls, value: Any) -> "PinOnFinishParams":
+        """Decode a parsed JSON value; raises JsonContractError on a contract violation."""
+        return decode_PinOnFinishParams(value)
+
+    def to_json_value(self) -> Dict[str, Any]:
+        """Encode to a JSON-ready value (json.dumps-compatible)."""
+        return encode_PinOnFinishParams(self)
 
 
 class TruncateParams(msgspec.Struct, kw_only=True, frozen=True):
@@ -1516,6 +1532,8 @@ def decode_GenerateRequest(value: Any) -> GenerateRequest:
             kw["modalities"] = None if x is None else decode_OptionalStringList(x)
         elif key == "truncate":
             kw["truncate"] = None if x is None else decode_TruncateParams(x)
+        elif key == "jc_pin_on_finish":
+            kw["jc_pin_on_finish"] = None if x is None else decode_PinOnFinishParams(x)
     return GenerateRequest(**kw)
 
 
@@ -1599,6 +1617,29 @@ def encode_GenerateRequest(v: GenerateRequest) -> Dict[str, Any]:
         d["modalities"] = encode_OptionalStringList(v.modalities)
     if v.truncate is not None:
         d["truncate"] = encode_TruncateParams(v.truncate)
+    if v.jc_pin_on_finish is not None:
+        d["jc_pin_on_finish"] = encode_PinOnFinishParams(v.jc_pin_on_finish)
+    return d
+
+
+_FIELDS_PinOnFinishParams = ("ttl_s",)
+
+
+def decode_PinOnFinishParams(value: Any) -> PinOnFinishParams:
+    m = _expect_map(value, expected="struct PinOnFinishParams")
+    kw: Dict[str, Any] = {}
+    for key, x in m.items():
+        if key == "ttl_s":
+            kw["ttl_s"] = None if x is None else _expect_float(x, expected="f64")
+        else:
+            raise _unknown_field(key, fields=_FIELDS_PinOnFinishParams)
+    return PinOnFinishParams(**kw)
+
+
+def encode_PinOnFinishParams(v: PinOnFinishParams) -> Dict[str, Any]:
+    d: Dict[str, Any] = {}
+    if v.ttl_s is not None:
+        d["ttl_s"] = float(v.ttl_s)
     return d
 
 

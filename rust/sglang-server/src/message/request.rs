@@ -109,6 +109,7 @@ pub fn into_requests(
         cache_salt,
         session_params,
         truncate,
+        jc_pin_on_finish,
         ..
     } = req;
     if session_params.is_some() {
@@ -121,6 +122,13 @@ pub fn into_requests(
     if truncate.is_some() {
         return Err(Error::Validation(
             "truncate is not supported by the Rust server".into(),
+        ));
+    }
+    // Joint checkpoint pin-on-finish is scheduler state the Rust server does
+    // not forward; dropping it would silently leave the KV unpinned.
+    if jc_pin_on_finish.is_some() {
+        return Err(Error::Validation(
+            "jc_pin_on_finish is not supported by the Rust server".into(),
         ));
     }
     let rid = rid.and_then(wire::string_or_list);
@@ -1239,6 +1247,18 @@ mod tests {
             .unwrap_err()
             .to_string();
         assert!(err.contains("truncate is not supported"), "{err}");
+    }
+
+    /// Joint checkpoint `jc_pin_on_finish` is in the schema but not forwarded
+    /// to the scheduler: a non-null value is a 400, `null` passes.
+    #[test]
+    fn jc_pin_on_finish_is_rejected_unless_null() {
+        let (ps, _) = requests(r#"{"text": "hi", "jc_pin_on_finish": null}"#).unwrap();
+        assert_eq!(ps.len(), 1);
+        let err = requests(r#"{"text": "hi", "jc_pin_on_finish": {"ttl_s": 5.0}}"#)
+            .unwrap_err()
+            .to_string();
+        assert!(err.contains("jc_pin_on_finish is not supported"), "{err}");
     }
 
     /// Client-supplied rid semantics mirror Python's `_normalize_batch`: a

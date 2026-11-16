@@ -67,6 +67,7 @@ from http import HTTPStatus
 from typing import (
     TYPE_CHECKING,
     Any,
+    Callable,
     Dict,
     List,
     Literal,
@@ -1206,6 +1207,14 @@ class Req(ReqDllmMixin):
         self.jc_truncate_to: Optional[int] = None
         self.jc_admit_first: bool = False
         self.jc_truncate_pos: Optional[int] = None
+        # Joint checkpoint pin-on-finish. jc_finish_hold is the scheduler's
+        # hook, which release_kv_cache calls once it has written the finished
+        # request's KV into the tree and before the request's own lock goes;
+        # None when the request did not ask. jc_pin_outcome is what the final
+        # chunk merges into meta_info (None when not asked).
+        self.jc_finish_hold: Optional[Callable[[Req], None]] = None
+        self.jc_pin_ttl_s: Optional[float] = None
+        self.jc_pin_outcome: Optional[Dict[str, Any]] = None
 
         # For incremental decoding
         # ----- | --------- read_ids -------|

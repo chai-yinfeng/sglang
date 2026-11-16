@@ -97,6 +97,7 @@ class MockReq:
     finished_reason = None
     skip_radix_cache_insert = False
     finished_len = None
+    jc_finish_hold = None
 
     def __init__(self, cache, rid, fill_ids, prompt_len):
         self.rid = rid

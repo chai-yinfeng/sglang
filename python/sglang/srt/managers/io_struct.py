@@ -173,6 +173,19 @@ class TruncateParams(msgspec.Struct, kw_only=True, array_like=True):
     pos: int
 
 
+class PinOnFinishParams(msgspec.Struct, kw_only=True, array_like=True):
+    """Joint checkpoint pin-on-finish (--enable-joint-checkpoint): when the
+    carrying request finishes with its KV written to the radix tree (stop,
+    length, or a plain abort; not a discard or a truncate cut), the scheduler
+    holds that KV in the same step, as /pin_request on its rid would: same
+    pin_table record, TTL ``ttl_s`` (None uses --jc-pin-ttl-s; <= 0 never
+    expires) and --jc-pin-max-ratio cap. The outcome is reported in the final
+    chunk's meta_info as ``jc_pinned_len`` (and ``jc_pin_message`` when
+    nothing was pinned)."""
+
+    ttl_s: Optional[float] = None
+
+
 # Type definitions for multimodal input data
 # Individual data item types for each modality
 ImageDataInputItem = Union[str, bytes, Dict[str, Any], ImageData, Image]
@@ -402,6 +415,10 @@ class GenerateReqInput:
     # ones. See io_struct.TruncateParams.
     truncate: Optional[Dict[str, Any]] = None
 
+    # Joint checkpoint pin-on-finish, single requests only: {} or
+    # {"ttl_s": <seconds>}. See io_struct.PinOnFinishParams.
+    jc_pin_on_finish: Optional[Dict[str, Any]] = None
+
     def regenerate_rid(self):
         """Generate a new request ID and return it."""
         if isinstance(self.rid, list):
@@ -458,6 +475,8 @@ class GenerateReqInput:
         self._handle_parallel_sampling()
         if self.truncate is not None:
             self._validate_truncate()
+        if self.jc_pin_on_finish is not None:
+            self._validate_jc_pin_on_finish()
 
         if self.is_single:
             self._normalize_single_inputs()
@@ -488,6 +507,27 @@ class GenerateReqInput:
             raise ValueError(
                 'truncate must be {"rid": <non-empty string>, "pos": <non-negative int>}.'
             )
+
+    def _validate_jc_pin_on_finish(self):
+        """Joint checkpoint pin-on-finish: one request outside session_params,
+        with {} or {"ttl_s": <number or null>}."""
+        if not self.is_single:
+            raise ValueError("jc_pin_on_finish is not supported for batch requests.")
+        if self.session_params is not None:
+            raise ValueError("jc_pin_on_finish and session_params cannot both be set.")
+        p = self.jc_pin_on_finish
+        if (
+            not isinstance(p, dict)
+            or not set(p) <= {"ttl_s"}
+            or not (
+                p.get("ttl_s") is None
+                or (
+                    isinstance(p["ttl_s"], (int, float))
+                    and not isinstance(p["ttl_s"], bool)
+                )
+            )
+        ):
+            raise ValueError('jc_pin_on_finish must be {} or {"ttl_s": <number>}.')
 
     def _validate_inputs(self):
         """Validate that the input configuration is valid."""
@@ -1228,6 +1268,9 @@ class TokenizedGenerateReqInput(BaseReq, kw_only=True):
     # Joint checkpoint truncate (GenerateReqInput.truncate). A defaulted tail
     # field: the Rust server rejects truncate and never emits this slot.
     truncate: Optional[TruncateParams] = None
+    # Joint checkpoint pin-on-finish (GenerateReqInput.jc_pin_on_finish). A
+    # defaulted tail field: the Rust server rejects it and never emits this slot.
+    jc_pin_on_finish: Optional[PinOnFinishParams] = None
 
     def wrap_pickle_fields(self):
         self.time_stats = wrap_as_pickle(self.time_stats)
@@ -1775,6 +1818,11 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
 
+    # Joint checkpoint pin-on-finish outcome of a finished request, merged
+    # into its meta_info: {"jc_pinned_len": int[, "jc_pin_message": str]}.
+    # None entries elsewhere; the whole field is None when no row has one.
+    jc_pin_outcomes: Optional[List[Optional[Dict[str, Any]]]] = None
+
 
 class BatchStrOutput(BaseBatchReq, kw_only=True):
     # The finish reason
@@ -1865,6 +1913,9 @@ class BatchStrOutput(BaseBatchReq, kw_only=True):
     input_top_logprobs_val_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_idx_flat: Optional[List[Optional[np.ndarray]]] = None
     input_top_logprobs_flat_null_prefix: Optional[List[Optional[int]]] = None
+
+    # Detokenizer pass-through; see BatchTokenIDOutput.jc_pin_outcomes.
+    jc_pin_outcomes: Optional[List[Optional[Dict[str, Any]]]] = None
 
 
 class BatchEmbeddingOutput(BaseBatchReq, kw_only=True):

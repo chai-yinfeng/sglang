@@ -429,6 +429,10 @@ def release_kv_cache(req: Req, tree_cache: BasePrefixCache, *, checkpoint: bool)
         # The fill-id array lags output_ids until the next prepare_for_decode.
         req.refresh_fill_ids()
         tree_cache.checkpoint(req, up_to=owned_kv_len)
+        if req.jc_finish_hold is not None:
+            # Joint checkpoint pin-on-finish: lock [0, cache_protected_len)
+            # while req.lock still holds it.
+            req.jc_finish_hold(req)
     # The protected prefix is not this req's to free.
     tree_cache.free_kv_row(req.kv, [(req.kv.cache_protected_len, owned_kv_len)])
     tree_cache.unlock(req.lock)

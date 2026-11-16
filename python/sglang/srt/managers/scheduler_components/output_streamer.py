@@ -377,6 +377,7 @@ class _GenerationStreamAccumulator:
     spec_cap_lens_histogram: list = field(default_factory=list)
     retraction_counts: list = field(default_factory=list)
     weight_versions: list = field(default_factory=list)
+    jc_pin_outcomes: list = field(default_factory=list)
     output_hidden_states: Optional[list] = None
     routed_experts: Optional[list] = None
     indexer_topk: Optional[list] = None
@@ -538,6 +539,7 @@ class _GenerationStreamAccumulator:
         self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
+        self.jc_pin_outcomes.append(req.jc_pin_outcome if req.finished() else None)
         if req.finished():
             self.weight_versions.append(
                 compute_weight_version_spans(
@@ -796,6 +798,11 @@ class _GenerationStreamAccumulator:
             ),
             weight_versions=(
                 self.weight_versions if any(self.weight_versions) else None
+            ),
+            jc_pin_outcomes=(
+                self.jc_pin_outcomes
+                if any(x is not None for x in self.jc_pin_outcomes)
+                else None
             ),
             dp_ranks=dp_ranks,
         )

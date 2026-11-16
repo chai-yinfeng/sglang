@@ -22,6 +22,10 @@ real Req objects.
   without cold requests or the chunked request's next chunk, at most
   JC_ADMIT_FIRST_MAX_CONSECUTIVE times in a row; admission drops their
   truncate holds; flag off is admission as without the mark.
+- Pin-on-finish (TestJointCheckpointPinOnFinish): a request carrying
+  jc_pin_on_finish gets, when release_kv_cache writes its KV into the tree,
+  the hold /pin_request would make (pin_table record, TTL, cap), reported in
+  its final chunk; discard and releases without a tree insert take none.
 """
 
 import unittest
@@ -34,11 +38,15 @@ import torch
 
 import sglang.srt.managers.scheduler as scheduler_module
 from sglang.srt.disaggregation.utils import DisaggregationMode
+from sglang.api.v1.api_types import GenerateRequest, JsonContractError
 from sglang.srt.managers.io_struct import (
     AbortReq,
+    GenerateReqInput,
+    PinOnFinishParams,
     PinReqInput,
     SessionParams,
     TruncateParams,
+    UnpinReqInput,
 )
 from sglang.srt.managers.schedule_batch import (
     FINISH_ABORT,
@@ -791,6 +799,216 @@ class TestJointCheckpointTruncatePaged(_TruncateFixture):
             self.cache.unlock(succ.lock)
         _, err = self.truncate(s, "old", 16, prefix=FILL, append=(1,))
         self.assertIn("no pin covers position 16", err)
+
+
+class _PinOnFinishFixture(_TruncateFixture):
+    def armed(self, s, rid, prompt=PROMPT, outputs=OUTPUT, ttl_s=None, **kw) -> Req:
+        """A running request whose /generate carried jc_pin_on_finish."""
+        req = self.start(rid, prompt, outputs, **kw)
+        recv = SimpleNamespace(
+            session_params=None, jc_pin_on_finish=PinOnFinishParams(ttl_s=ttl_s)
+        )
+        self.assertIsNone(s._jc_arm_pin_on_finish(req, recv))
+        s.running_batch.reqs = s.running_batch.reqs + [req]
+        return req
+
+    def finish(self, req, reason=None, checkpoint=True):
+        """What process_batch_result does once the request finishes."""
+        req.finished_reason = reason or FINISH_LENGTH(length=len(req.output_ids))
+        req.finished_len = len(req.output_ids)
+        release_kv_cache(req, self.cache, checkpoint=checkpoint)
+
+    def abort(self, s, rid, discard=False):
+        s.mm_receiver = None
+        s.grammar_manager = MagicMock()
+        s.abort_request(AbortReq(rid=rid, discard=discard))
+        req = next(r for r in s.running_batch.reqs if r.rid == rid)
+        self.finish(req, reason=req.to_finish)
+        return req
+
+
+class TestJointCheckpointPinOnFinish(_PinOnFinishFixture):
+    def test_finish_holds_the_whole_kv_like_a_pin(self):
+        streamer = self.real_streamer()
+        s = self.make_scheduler(streamer=streamer)
+        old = self.armed(s, "old")
+        self.finish(old)
+        pin = s.pin_table["old"]
+        self.assertEqual(
+            (pin.pinned_len, pin.pinned_at, pin.expires_at, pin.successor_of),
+            (len(FILL), 1000.0, 1600.0, None),
+        )
+        self.evict_all()
+        self.assertEqual(self.match_len(FILL), len(FILL))
+        streamer.stream_output([old], False)
+        payload = streamer.send_to_detokenizer.send_output.call_args[0][0]
+        self.assertEqual(payload.jc_pin_outcomes, [{"jc_pinned_len": len(FILL)}])
+        # Without the field nothing extra goes on the wire.
+        plain = self.start("plain", [p + 1000 for p in PROMPT], OUTPUT)
+        self.finish(plain)
+        streamer.stream_output([plain], False)
+        payload = streamer.send_to_detokenizer.send_output.call_args[0][0]
+        self.assertIsNone(payload.jc_pin_outcomes)
+        self.assertEqual(set(s.pin_table), {"old"})
+
+    def test_plain_abort_holds_discard_does_not(self):
+        s = self.make_scheduler()
+        other = [p + 1000 for p in PROMPT]
+        aborted = self.armed(s, "a")
+        discarded = self.armed(s, "d", prompt=other)
+        self.abort(s, "a")
+        self.abort(s, "d", discard=True)
+        self.assertEqual(set(s.pin_table), {"a"})
+        self.assertEqual(aborted.jc_pin_outcome, {"jc_pinned_len": len(FILL)})
+        self.assertEqual(
+            discarded.jc_pin_outcome,
+            {
+                "jc_pinned_len": 0,
+                "jc_pin_message": "request finished without writing its KV to the radix tree",
+            },
+        )
+        self.evict_all()
+        self.assertEqual(self.match_len(FILL), len(FILL))
+        self.assertEqual(self.match_len(other + OUTPUT), 0)
+
+    def test_release_without_tree_insert_keeps_the_hook_armed(self):
+        """A release that writes nothing to the tree (retraction, chunked
+        abort) takes no hold and must not disarm a later finish."""
+        s = self.make_scheduler()
+        old = self.armed(s, "old")
+        release_kv_cache(old, self.cache, checkpoint=False)
+        self.assertEqual(s.pin_table, {})
+        self.assertIsNotNone(old.jc_finish_hold)
+        self.assertEqual(self.allocator.available_size(), POOL_SIZE)
+
+    def test_cap_refusal_takes_no_hold_and_keeps_an_earlier_pin(self):
+        # limit int(0.12 x 256) = 30: "b" holds 16, "old" its own 12.
+        s = self.make_scheduler(max_ratio=0.12)
+        b = self.armed(s, "b", prompt=[p + 1000 for p in PROMPT])
+        self.finish(b)
+        old = self.armed(s, "old")
+        self.assertTrue(s.pin_request(PinReqInput(rid="old", up_to=12)).success)
+        earlier = s.pin_table["old"]
+        self.finish(old)
+        self.assertIs(s.pin_table["old"], earlier)
+        self.assertEqual(old.jc_pin_outcome["jc_pinned_len"], 0)
+        self.assertEqual(
+            old.jc_pin_outcome["jc_pin_message"],
+            "pin cap exceeded: 16 tokens pinned by other holds + 16 for old > "
+            "limit 30 (--jc-pin-max-ratio 0.12 x 256)",
+        )
+        self.evict_all()
+        self.assertEqual(self.match_len(FILL), 12)
+
+    def test_earlier_client_pin_is_replaced_without_leaking_its_lock(self):
+        # limit 25: 12 (earlier pin) + 16 would be refused unless the rid's
+        # own earlier hold is replaced, as on a re-pin.
+        s = self.make_scheduler(max_ratio=0.1)
+        old = self.armed(s, "old")
+        self.assertTrue(s.pin_request(PinReqInput(rid="old", up_to=12)).success)
+        self.finish(old)
+        self.assertEqual(s.pin_table["old"].pinned_len, len(FILL))
+        self.assertTrue(s.unpin_request(UnpinReqInput(rid="old")).success)
+        self.evict_all()
+        self.assertEqual(self.match_len(FILL), 0)
+        self.assertEqual(self.allocator.available_size(), POOL_SIZE)
+
+    def test_ttl_expiry_and_unpin_release_the_hold(self):
+        s = self.make_scheduler()
+        short = self.armed(s, "short", ttl_s=5.0)
+        kept = self.armed(s, "kept", prompt=[p + 1000 for p in PROMPT], ttl_s=0)
+        self.finish(short)
+        self.finish(kept)
+        self.assertEqual(s.pin_table["short"].expires_at, 1005.0)
+        self.assertIsNone(s.pin_table["kept"].expires_at)
+        self.now += 5
+        s._jc_on_step(ScheduleBatch(reqs=[], batch_is_full=False))
+        self.assertEqual(set(s.pin_table), {"kept"})
+        s.unpin_request(UnpinReqInput(rid="kept"))
+        self.evict_all()
+        self.assertEqual(self.allocator.available_size(), POOL_SIZE)
+
+    def test_truncate_of_the_finished_request_uses_the_hold(self):
+        s = self.make_scheduler()
+        old = self.armed(s, "old")
+        self.finish(old)
+        s.running_batch.filter_batch()
+        self.evict_all()
+        for pos in (len(PROMPT), len(FILL)):
+            succ, err = self.truncate(s, "old", pos, rid=f"succ{pos}")
+            self.assertIsNone(err, pos)
+            self.admit(s, succ)
+            self.assertEqual(succ.prefix_len, pos)
+            self.cache.unlock(succ.lock)
+        _, err = self.truncate(s, "old", len(FILL) + 1, prefix=FILL + [7])
+        self.assertIn("no pin covers position", err)
+
+    def test_flag_off_runs_unpinned_and_reports_it(self):
+        s = self.make_scheduler(enable=False)
+        old = self.start("old", PROMPT, OUTPUT)
+        recv = SimpleNamespace(
+            session_params=None, jc_pin_on_finish=PinOnFinishParams()
+        )
+        self.assertIsNone(s._jc_arm_pin_on_finish(old, recv))
+        self.finish(old)
+        self.assertEqual(s.pin_table, {})
+        self.assertEqual(
+            old.jc_pin_outcome,
+            {
+                "jc_pinned_len": 0,
+                "jc_pin_message": "--enable-joint-checkpoint is not set",
+            },
+        )
+
+    def test_rejected_with_session_params_or_when_barred(self):
+        s = self.make_scheduler()
+        req = make_req("r", PROMPT)
+        recv = SimpleNamespace(
+            session_params=SessionParams(id="x"), jc_pin_on_finish=PinOnFinishParams()
+        )
+        self.assertIn("session_params", s._jc_arm_pin_on_finish(req, recv))
+        recv.session_params = None
+        req.skip_radix_cache_insert = True
+        self.assertIn("barred", s._jc_arm_pin_on_finish(req, recv))
+        self.assertIsNone(req.jc_finish_hold)
+
+
+class TestJointCheckpointPinOnFinishPaged(_PinOnFinishFixture):
+    page_size = 4
+
+    def test_finish_hold_is_page_aligned(self):
+        s = self.make_scheduler()
+        # Without overlap the last token has no KV: 15 committed, 12 in pages.
+        old = self.armed(s, "old", overlap=False)
+        self.finish(old)
+        self.assertEqual(s.pin_table["old"].pinned_len, 12)
+        self.assertEqual(old.jc_pin_outcome, {"jc_pinned_len": 12})
+
+
+class TestJointCheckpointPinOnFinishWire(CustomTestCase):
+    def test_generate_schema_accepts_the_field(self):
+        """The api_contract gate validates /generate against the generated
+        schema; a field missing there is a 400 "unknown field"."""
+        req = GenerateRequest.from_json_value(
+            {"input_ids": [1, 2], "jc_pin_on_finish": {"ttl_s": 5}}
+        )
+        self.assertEqual(req.jc_pin_on_finish.ttl_s, 5.0)
+        GenerateRequest.from_json_value({"input_ids": [1], "jc_pin_on_finish": {}})
+        with self.assertRaises(JsonContractError):
+            GenerateRequest.from_json_value(
+                {"input_ids": [1], "jc_pin_on_finish": {"ttl": 5}}
+            )
+
+    def test_normalization_rejects_batches_and_bad_shapes(self):
+        for bad in ({"ttl": 5}, {"ttl_s": "5"}, {"ttl_s": True}, True):
+            obj = GenerateReqInput(input_ids=[1, 2], jc_pin_on_finish=bad)
+            with self.assertRaises(ValueError, msg=bad):
+                obj.normalize_batch_and_arguments()
+        obj = GenerateReqInput(input_ids=[[1], [2]], jc_pin_on_finish={})
+        with self.assertRaisesRegex(ValueError, "batch"):
+            obj.normalize_batch_and_arguments()
+        obj = GenerateReqInput(input_ids=[1, 2], jc_pin_on_finish={"ttl_s": None})
+        obj.normalize_batch_and_arguments()
 
 
 # ---------------------------------------------------------------- exclusive admission

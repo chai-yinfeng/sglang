@@ -3387,6 +3387,14 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
+        if recv_req.jc_pin_on_finish is not None:
+            error_msg = self._jc_arm_pin_on_finish(req, recv_req)
+            if error_msg is not None:
+                req.jc_pin_outcome = {"jc_pinned_len": 0, "jc_pin_message": error_msg}
+                req.set_finish_with_abort(error_msg)
+                self._add_request_to_queue(req)
+                return
+
         if get_parallel().pp_rank == 0 and getattr(
             self.tree_cache.cache_controller, "pp_prefetch_command_group", None
         ):
@@ -6633,29 +6641,17 @@ class Scheduler(
         up_to = min(
             recv_req.up_to, req.owned_kv_len(), len(req.full_untruncated_fill_ids)
         )
-        # Global cap, checked before anything touches the tree. The hold will
-        # cover at most max(up_to, cache_protected_len) tokens (checkpoint
-        # page-aligns down). The total sums pinned_len over holds, so a prefix
-        # shared by several holds is counted once per hold: a conservative
-        # (over-)estimate of the KV that pins keep out of eviction. A re-pin
-        # of the same rid is judged on the total after the replacement.
-        if self.jc_pin_max_ratio > 0:
-            others = self._jc_pinned_tokens_total() - (
-                self.pin_table[rid].pinned_len if rid in self.pin_table else 0
+        # Checked before anything touches the tree: the hold will cover at
+        # most max(up_to, cache_protected_len) tokens (checkpoint page-aligns down).
+        refusal = self._jc_pin_cap_refusal(
+            rid=rid, pin_len=max(up_to, req.kv.cache_protected_len)
+        )
+        if refusal is not None:
+            return PinReqOutput(
+                success=False,
+                message=refusal,
+                pinned_tokens_total=self._jc_pinned_tokens_total(),
             )
-            projected = others + max(up_to, req.kv.cache_protected_len)
-            limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
-            if projected > limit:
-                return PinReqOutput(
-                    success=False,
-                    message=(
-                        f"pin cap exceeded: {others} tokens pinned by other "
-                        f"holds + {projected - others} for {rid} > limit {limit} "
-                        f"(--jc-pin-max-ratio {self.jc_pin_max_ratio} x "
-                        f"{self.max_total_num_tokens})"
-                    ),
-                    pinned_tokens_total=self._jc_pinned_tokens_total(),
-                )
         if up_to > req.kv.cache_protected_len:
             # checkpoint page-aligns the insert and moves req.lock / req.last_node
             # to the node it ended on.
@@ -6663,22 +6659,14 @@ class Scheduler(
         # [0, cache_protected_len) is already in the tree, ending at last_node;
         # a shorter up_to is covered by holding that node.
         pinned_len = req.kv.cache_protected_len
-        new_lock = self.tree_cache.lock(req.last_node)
-        if new_lock is None:
+        ttl_s = recv_req.ttl_s if recv_req.ttl_s is not None else self.jc_pin_ttl_s
+        if not self._jc_take_hold(
+            rid=rid, node=req.last_node, pinned_len=pinned_len, ttl_s=ttl_s
+        ):
             return PinReqOutput(
                 success=False, pinned_len=0, message="tree did not hand out a lock"
             )
-        ttl_s = recv_req.ttl_s if recv_req.ttl_s is not None else self.jc_pin_ttl_s
-        now = time.monotonic()
-        expires_at = now + ttl_s if ttl_s > 0 else None
-        # Re-pinning the same rid replaces the earlier hold and restarts its TTL.
-        old_pin = self.pin_table.pop(rid, None)
-        self.pin_table[rid] = JcPin(
-            lock=new_lock, pinned_len=pinned_len, pinned_at=now, expires_at=expires_at
-        )
-        if old_pin is not None:
-            self.tree_cache.unlock(old_pin.lock)
-        expires_in_s = ttl_s if expires_at is not None else None
+        expires_in_s = ttl_s if ttl_s > 0 else None
         pinned_tokens_total = self._jc_pinned_tokens_total()
         logger.info(
             f"joint-checkpoint: pinned rid={rid} len={pinned_len} "
@@ -6690,6 +6678,112 @@ class Scheduler(
             pinned_len=pinned_len,
             expires_in_s=expires_in_s,
             pinned_tokens_total=pinned_tokens_total,
+        )
+
+    def _jc_pin_cap_refusal(self, *, rid: str, pin_len: int) -> Optional[str]:
+        """The --jc-pin-max-ratio refusal for a hold of ``pin_len`` tokens on
+        ``rid``, or None. Judged on the total after replacing the rid's own
+        earlier hold; the total sums pinned_len over holds, so a prefix shared
+        by several holds is counted once per hold (a conservative over-estimate
+        of the KV that pins keep out of eviction)."""
+        if self.jc_pin_max_ratio <= 0:
+            return None
+        prev = self.pin_table.get(rid)
+        others = self._jc_pinned_tokens_total() - (
+            prev.pinned_len if prev is not None else 0
+        )
+        limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
+        if others + pin_len <= limit:
+            return None
+        return (
+            f"pin cap exceeded: {others} tokens pinned by other holds + "
+            f"{pin_len} for {rid} > limit {limit} (--jc-pin-max-ratio "
+            f"{self.jc_pin_max_ratio} x {self.max_total_num_tokens})"
+        )
+
+    def _jc_take_hold(
+        self, *, rid: str, node: Any, pinned_len: int, ttl_s: float
+    ) -> bool:
+        """Lock ``node`` (ending [0, pinned_len) in the tree) as the pin of
+        ``rid`` for ``ttl_s`` seconds (<= 0 never expires). An earlier hold of
+        the rid is replaced and unlocked, restarting the TTL. False, with
+        nothing changed, when the tree hands out no lock."""
+        new_lock = self.tree_cache.lock(node)
+        if new_lock is None:
+            return False
+        now = time.monotonic()
+        old_pin = self.pin_table.pop(rid, None)
+        self.pin_table[rid] = JcPin(
+            lock=new_lock,
+            pinned_len=pinned_len,
+            pinned_at=now,
+            expires_at=now + ttl_s if ttl_s > 0 else None,
+        )
+        if old_pin is not None:
+            self.tree_cache.unlock(old_pin.lock)
+        return True
+
+    def _jc_arm_pin_on_finish(
+        self, req: Req, recv_req: TokenizedGenerateReqInput
+    ) -> Optional[str]:
+        """Joint checkpoint pin-on-finish at request intake: arm the hold that
+        release_kv_cache takes (_jc_hold_on_finish) when ``req`` finishes with
+        its KV written to the tree. Returns an error message for a request
+        that cannot be pinned. Without --enable-joint-checkpoint the request
+        runs unchanged and reports jc_pinned_len 0."""
+        if not self.enable_joint_checkpoint:
+            req.jc_pin_outcome = {
+                "jc_pinned_len": 0,
+                "jc_pin_message": "--enable-joint-checkpoint is not set",
+            }
+            return None
+        if recv_req.session_params is not None:
+            return "jc_pin_on_finish cannot be combined with session_params"
+        if (
+            self.disaggregation_mode != DisaggregationMode.NULL
+            or self.dllm_config is not None
+        ):
+            return "jc_pin_on_finish is not supported with PD disaggregation or dLLM"
+        if req.skip_radix_cache_insert:
+            return "jc_pin_on_finish: request is barred from the radix tree"
+        req.jc_pin_ttl_s = recv_req.jc_pin_on_finish.ttl_s
+        req.jc_finish_hold = self._jc_hold_on_finish
+        # Replaced by _jc_hold_on_finish; stays when the request finishes
+        # without a tree insert (discard, truncate cut, chunked-prefill abort).
+        req.jc_pin_outcome = {
+            "jc_pinned_len": 0,
+            "jc_pin_message": "request finished without writing its KV to the radix tree",
+        }
+        return None
+
+    def _jc_hold_on_finish(self, req: Req) -> None:
+        """Joint checkpoint pin-on-finish: release_kv_cache calls this once the
+        finished ``req``'s KV is in the tree and before its own lock goes.
+        Holds [0, cache_protected_len) exactly as /pin_request on its rid would
+        (same record, TTL and cap). Over the cap no hold is taken and an
+        earlier pin on the rid stays as it was."""
+        req.jc_finish_hold = None
+        pinned_len = req.kv.cache_protected_len
+        ttl_s = req.jc_pin_ttl_s if req.jc_pin_ttl_s is not None else self.jc_pin_ttl_s
+        if pinned_len <= 0:
+            refusal = "no KV of the request is in the radix tree"
+        else:
+            refusal = self._jc_pin_cap_refusal(rid=req.rid, pin_len=pinned_len)
+        if refusal is None and not self._jc_take_hold(
+            rid=req.rid, node=req.last_node, pinned_len=pinned_len, ttl_s=ttl_s
+        ):
+            refusal = "tree did not hand out a lock"
+        if refusal is not None:
+            req.jc_pin_outcome = {"jc_pinned_len": 0, "jc_pin_message": refusal}
+            logger.info(
+                f"joint-checkpoint: no pin on finish for rid={req.rid}: {refusal}"
+            )
+            return
+        req.jc_pin_outcome = {"jc_pinned_len": pinned_len}
+        logger.info(
+            f"joint-checkpoint: pinned on finish rid={req.rid} len={pinned_len} "
+            f"expires_in_s={ttl_s if ttl_s > 0 else None} "
+            f"pinned_tokens_total={self._jc_pinned_tokens_total()}"
         )
 
     def unpin_request(self, recv_req: UnpinReqInput):

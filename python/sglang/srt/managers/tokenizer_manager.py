@@ -104,6 +104,7 @@ from sglang.srt.managers.io_struct import (
     SessionParams,
     ShutdownReq,
     TokenizedEmbeddingReqInput,
+    PinOnFinishParams,
     TokenizedGenerateReqInput,
     TruncateParams,
     UpdateWeightFromDiskReqInput,
@@ -1634,6 +1635,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 truncate=(
                     TruncateParams(**obj.truncate) if obj.truncate is not None else None
                 ),
+                jc_pin_on_finish=(
+                    PinOnFinishParams(**obj.jc_pin_on_finish)
+                    if obj.jc_pin_on_finish is not None
+                    else None
+                ),
             )
         elif isinstance(obj, EmbeddingReqInput):
             # Resolve unresolved embed overrides now that input_ids are available
@@ -2609,6 +2615,11 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                         spans,
                         num_output_tokens=recv_obj.completion_tokens[i],
                     )
+                if (
+                    recv_obj.jc_pin_outcomes is not None
+                    and (jc_pin := recv_obj.jc_pin_outcomes[i]) is not None
+                ):
+                    meta_info.update(jc_pin)
                 # Add detailed cache breakdown if available
                 if (
                     hasattr(recv_obj, "cached_tokens_details")
@@ -3655,6 +3666,13 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 recv_obj.weight_versions,
                 num_output_tokens=len(state.output_ids),
             )
+        if (
+            isinstance(state.obj, GenerateReqInput)
+            and state.obj.jc_pin_on_finish is not None
+        ):
+            # Aborted before the scheduler ran it: there is no KV to pin.
+            meta_info["jc_pinned_len"] = 0
+            meta_info["jc_pin_message"] = "request was aborted before it held KV"
         is_stream = getattr(state.obj, "stream", False)
         if getattr(state.obj, "return_logprob", False):
             self.add_logprob_to_meta_info(
