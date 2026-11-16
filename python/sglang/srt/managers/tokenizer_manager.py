@@ -74,6 +74,7 @@ from sglang.srt.layers.joint_schema_head import (
     parse_decision_layout,
 )
 from sglang.srt.lora.lora_registry import LoRARef, LoRARegistry
+from sglang.srt.managers.abort_tombstones import AbortTombstones
 from sglang.srt.managers.async_dynamic_batch_tokenizer import AsyncDynamicbatchTokenizer
 from sglang.srt.managers.disagg_service import start_disagg_service
 from sglang.srt.managers.embed_types import PositionalEmbeds
@@ -281,6 +282,9 @@ class ReqState:
 
     dispatched: bool = False
     abort_sent: bool = False
+    # Joint checkpoint: discard flag of an abort that arrived before this
+    # request was dispatched; sent right after dispatch (_mark_state_dispatched).
+    pending_abort_discard: Optional[bool] = None
 
     # Prevent duplicate releases after completion or ownership transfer.
     lora_released: bool = False
@@ -709,6 +713,8 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
     def init_running_status(self):
         # Request states
         self.rid_to_state: Dict[str, ReqState] = {}
+        # Joint checkpoint: aborts that arrived before their rid registered.
+        self.abort_tombstones = AbortTombstones()
         self.encoder_dispatch_ready: Dict[str, threading.Event] = {}
         self.event_loop = None
         self.asyncio_tasks = set()
@@ -1812,6 +1818,23 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
         state = self.rid_to_state.get(rid)
         if state is not None:
             state.dispatched = True
+            if state.pending_abort_discard is not None:
+                self._send_pending_abort(rid, state)
+
+    def _send_pending_abort(self, rid: str, state: ReqState):
+        """Joint checkpoint: send an abort held back until *rid* was dispatched.
+
+        Called synchronously right after the request itself was pushed, on the
+        same scheduler socket, so the scheduler sees the request before the
+        AbortReq and the abort matches it (see abort_request).
+        """
+        discard = state.pending_abort_discard
+        state.pending_abort_discard = None
+        state.abort_sent = False  # let abort_request send it now
+        try:
+            self.abort_request(rid, discard=discard)
+        except Exception:
+            logger.exception("Failed to send deferred abort for request %s", rid)
 
     async def _send_batch_request(
         self,
@@ -2255,7 +2278,21 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
                 if state.abort_sent:
                     return
                 state.abort_sent = True
+                if get_memory().enable_joint_checkpoint and not state.dispatched:
+                    # Joint checkpoint: the rid is registered but its request
+                    # has not been pushed to the scheduler yet (generate_request
+                    # may still be awaiting pause / weight-update locks, LoRA,
+                    # tokenization or mm transport). An AbortReq sent now would
+                    # reach the scheduler first, match nothing, and the request
+                    # would then run; abort_sent would also swallow any retry.
+                    # Hold it and send it right after dispatch instead.
+                    state.pending_abort_discard = discard
+                    return
             elif get_serving().tokenizer_worker_num == 1:
+                if get_memory().enable_joint_checkpoint:
+                    # Joint checkpoint: the abort beat its own /generate to
+                    # registration. Remember it; _init_req_state consumes it.
+                    self.abort_tombstones.add(rid, discard)
                 return
         req = AbortReq(rid=rid, abort_all=abort_all, discard=discard)
         try:
@@ -3852,6 +3889,16 @@ class TokenizerManager(TokenizerControlMixin, TokenizerManagerScoreMixin):
             new_states[rid] = state
 
         self.rid_to_state.update(new_states)
+
+        if get_memory().enable_joint_checkpoint and len(self.abort_tombstones):
+            for rid, state in new_states.items():
+                discard = self.abort_tombstones.pop(rid)
+                if discard is not None:
+                    # An abort for this rid arrived before it registered (see
+                    # abort_request). Treat it like an abort that arrives before
+                    # dispatch: it is sent right after the request.
+                    state.abort_sent = True
+                    state.pending_abort_discard = discard
 
     def _release_req_states_on_failure(self, request_states: Dict[str, ReqState]):
         """Release rid_to_state entries created for a failed handler.
