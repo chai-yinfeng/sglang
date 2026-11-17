@@ -656,8 +656,6 @@ class TestJointCheckpointTruncate(_TruncateFixture):
     def test_finished_request_rejected_without_covering_pin(self):
         msg = "request old is not running and no pin covers position {}"
         s = self.finished_with_pin(up_to=13)
-        _, err = self.truncate(s, "old", 14)
-        self.assertEqual(err, msg.format(14))
         # Expired but not yet stepped: no longer counts.
         self.now = s.pin_table["old"].expires_at
         _, err = self.truncate(s, "old", 12)
@@ -669,6 +667,26 @@ class TestJointCheckpointTruncate(_TruncateFixture):
         self.assertEqual(err, msg.format(12))
         _, err = self.truncate(s, "never-seen", 12)
         self.assertIn("request never-seen is not running", err)
+
+    def test_finished_request_with_a_shorter_pin_cuts_at_the_pin(self):
+        """A pin covering less than pos does not refuse the truncate: the cut
+        moves back to the pin's length and the successor recomputes the gap,
+        which the admit-first budget counts."""
+        s = self.finished_with_pin(up_to=13)
+        succ, err = self.truncate(s, "old", 15, append=(900, 901))
+        self.assertIsNone(err)
+        self.assertEqual((succ.jc_truncated_at, succ.jc_truncate_pos), (13, 13))
+        self.assertEqual(s._jc_appended_tokens(succ), 15 + 2 - 13)
+        self.assertEqual(set(s.pin_table), {"old"})
+        self.admit(s, succ)
+        self.assertEqual(succ.prefix_len, 13)
+        # Same path check as a degraded pin's: a foreign prefix is refused.
+        prefix = list(FILL[:15])
+        prefix[5] = 999
+        _, err = self.truncate(s, "old", 15, prefix=prefix, rid="bad")
+        self.assertIn(
+            "input_ids differ from the pinned path of request old at position 5", err
+        )
 
     def test_finished_request_still_in_batch_needs_a_pin(self):
         # Finished by the last result, not yet filtered: its KV is gone.
@@ -834,8 +852,9 @@ class TestJointCheckpointTruncatePaged(_TruncateFixture):
             self.admit(s, succ)
             self.assertEqual(succ.prefix_len, 12)
             self.cache.unlock(succ.lock)
-        _, err = self.truncate(s, "old", 16, prefix=FILL, append=(1,))
-        self.assertIn("no pin covers position 16", err)
+        succ, err = self.truncate(s, "old", 16, prefix=FILL, append=(1,))
+        self.assertIsNone(err)
+        self.assertEqual(succ.jc_truncated_at, 12)
 
 
 class _PinOnFinishFixture(_TruncateFixture):
@@ -977,8 +996,9 @@ class TestJointCheckpointPinOnFinish(_PinOnFinishFixture):
             self.admit(s, succ)
             self.assertEqual(succ.prefix_len, pos)
             self.cache.unlock(succ.lock)
-        _, err = self.truncate(s, "old", len(FILL) + 1, prefix=FILL + [7])
-        self.assertIn("no pin covers position", err)
+        succ, err = self.truncate(s, "old", len(FILL) + 1, prefix=FILL + [7])
+        self.assertIsNone(err)
+        self.assertEqual(succ.jc_truncated_at, len(FILL))
 
     def test_flag_off_runs_unpinned_and_reports_it(self):
         s = self.make_scheduler(enable=False)

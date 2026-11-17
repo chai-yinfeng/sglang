@@ -6377,7 +6377,7 @@ class Scheduler(
             if old_rid not in self.pin_table and old_rid in self.jc_degraded_pins:
                 error_msg, cut = self._jc_truncate_degraded(old_rid, pos, req)
             else:
-                error_msg = self._jc_truncate_pinned(old_rid, pos, req.rid)
+                error_msg, cut = self._jc_truncate_pinned(old_rid, pos, req)
         else:
             error_msg = self._jc_truncate_inflight(old, req, pos)
         if error_msg is not None:
@@ -6390,25 +6390,61 @@ class Scheduler(
         return None
 
     def _jc_truncate_pinned(
-        self, old_rid: str, pos: int, successor_rid: str
-    ) -> Optional[str]:
-        """Truncate of a request that already finished: accepted only while a
-        /pin_request hold on ``old_rid`` covers ``pos`` (page-aligned down,
-        like the successor's prefix match). The pin is what keeps that KV;
-        the successor's own lock takes over at admission."""
+        self, old_rid: str, pos: int, req: Req
+    ) -> Tuple[Optional[str], int]:
+        """Truncate of a request that already finished: accepted while an
+        unexpired /pin_request or pin-on-finish hold on ``old_rid`` vouches for
+        its KV; returns (error, cut). The cut is ``pos`` when the hold covers
+        it (page-aligned down, like the successor's prefix match), else the
+        hold's length: the successor recomputes the rest. The pin is what
+        keeps that KV and is left as it is; the successor's own lock takes
+        over at admission."""
         pin = self.pin_table.get(old_rid)
-        covered = pos // self.page_size * self.page_size
         if (
             pin is None
             or pin.successor_of is not None
             or time.monotonic() >= pin.expires_at
-            or pin.pinned_len < covered
         ):
-            return f"request {old_rid} is not running and no pin covers position {pos}"
+            return (
+                f"request {old_rid} is not running and no pin covers position {pos}"
+            ), 0
+        covered = pos // self.page_size * self.page_size
+        cut = pos if pin.pinned_len >= covered else pin.pinned_len
+        if pin.key is not None:
+            error_msg = self._jc_check_pinned_path(
+                old_rid=old_rid,
+                key=pin.key,
+                req=req,
+                upto=min(pos, pin.pinned_len),
+                pos=pos,
+            )
+            if error_msg is not None:
+                return error_msg, 0
         logger.info(
             f"joint-checkpoint: truncate of finished rid={old_rid} at pos={pos} "
-            f"via its pin (len={pin.pinned_len}); successor rid={successor_rid}"
+            f"via its pin (len={pin.pinned_len}): cut at {cut}; successor "
+            f"rid={req.rid}"
         )
+        return None, cut
+
+    @staticmethod
+    def _jc_check_pinned_path(
+        *, old_rid: str, key: RadixKey, req: Req, upto: int, pos: int
+    ) -> Optional[str]:
+        """A truncate successor continues a pinned path only in its cache
+        namespace and with the path's tokens as its input up to ``upto``."""
+        if (req.extra_key, req.cache_salt) != (key.extra_key, key.cache_salt):
+            return (
+                f"request {req.rid} is not in the cache namespace (extra_key, "
+                f"cache_salt, LoRA) of request {old_rid}"
+            )
+        path, ids = list(key.token_ids[:upto]), list(req.origin_input_ids[:upto])
+        if path != ids:
+            first = next(i for i in range(upto) if path[i] != ids[i])
+            return (
+                f"input_ids differ from the pinned path of request {old_rid} at "
+                f"position {first} (truncate pos={pos})"
+            )
         return None
 
     def _jc_truncate_degraded(
@@ -6421,19 +6457,12 @@ class Scheduler(
         The degraded record is consumed; the cut prefix is held for the
         successor through the valve, as a new pin would be."""
         rec = self.jc_degraded_pins[old_rid]
-        if (req.extra_key, req.cache_salt) != (rec.key.extra_key, rec.key.cache_salt):
-            return (
-                f"request {req.rid} is not in the cache namespace (extra_key, "
-                f"cache_salt, LoRA) of request {old_rid}"
-            ), 0
         want = min(pos, rec.pinned_len)
-        path, ids = list(rec.key.token_ids[:want]), list(req.origin_input_ids[:want])
-        if path != ids:
-            first = next(i for i in range(want) if path[i] != ids[i])
-            return (
-                f"input_ids differ from the pinned path of request {old_rid} at "
-                f"position {first} (truncate pos={pos})"
-            ), 0
+        error_msg = self._jc_check_pinned_path(
+            old_rid=old_rid, key=rec.key, req=req, upto=want, pos=pos
+        )
+        if error_msg is not None:
+            return error_msg, 0
         cut, node = self._jc_prefix_node(rec.key, want)
         del self.jc_degraded_pins[old_rid]
         held = 0
