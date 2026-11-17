@@ -4390,11 +4390,16 @@ class Scheduler(
                 req.time_stats.observe_storage_staging_ready(staging_ready)
                 if not staging_ready:
                     continue
-            res = adder.add_one_req(
-                req,
-                has_chunked_req=(self.chunked_req is not None),
-                truncation_align_size=self.truncation_align_size,
-            )
+            if jc_exclusive is not None and not self._jc_exclusive_admits(
+                req, adder.can_run_list
+            ):
+                res = AddReqResult.OTHER
+            else:
+                res = adder.add_one_req(
+                    req,
+                    has_chunked_req=(self.chunked_req is not None),
+                    truncation_align_size=self.truncation_align_size,
+                )
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -6387,6 +6392,10 @@ class Scheduler(
         req.jc_admit_first = True
         req.jc_truncate_pos = cut
         req.jc_truncated_at = cut
+        hold = self.pin_table.get(req.rid)
+        req.jc_successor_held = (
+            hold.pinned_len if hold is not None and hold.successor_of is not None else 0
+        )
         return None
 
     def _jc_truncate_pinned(
@@ -6455,7 +6464,7 @@ class Scheduler(
         hold's path, up to ``pos``, still in the tree (eviction may have taken
         its tail; the successor recomputes from there, 0 if nothing is left).
         The degraded record is consumed; the cut prefix is held for the
-        successor through the valve, as a new pin would be."""
+        successor as far as the cap allows without degrading anyone."""
         rec = self.jc_degraded_pins[old_rid]
         want = min(pos, rec.pinned_len)
         error_msg = self._jc_check_pinned_path(
@@ -6473,7 +6482,6 @@ class Scheduler(
                 node=node,
                 length=cut,
                 key=rec.key,
-                via_valve=True,
             )
         logger.info(
             f"joint-checkpoint: truncate of finished rid={old_rid} at pos={pos} "
@@ -6587,7 +6595,6 @@ class Scheduler(
             node=old.last_node,
             length=kept,
             key=self._jc_pin_key(old, kept),
-            via_valve=False,
         )
 
     def _jc_successor_hold(
@@ -6598,29 +6605,25 @@ class Scheduler(
         node: Any,
         length: int,
         key: RadixKey,
-        via_valve: bool,
     ) -> int:
         """Hold [0, length) of the path ``key`` (ending at ``node``) for the
         request that continues ``cut_rid``, keyed by its rid in pin_table with
         a JC_TRUNCATE_HOLD_TTL_S backstop, so nothing evicts the prefix before
         that request is admitted and locks it itself
-        (_jc_release_truncate_hold). Over the cap: through the valve
-        (``via_valve``) other pins may be degraded; a prefix that still does
-        not fit is held as far as it fits (lru) or not at all. Returns the
-        length held."""
+        (_jc_release_truncate_hold). Outside the pressure valve: it never
+        degrades another pin. Over the cap it holds the longest prefix that
+        fits beside the other holds (--jc-pin-overflow lru) or nothing; the
+        truncate does not depend on it (admission reuses whatever prefix is
+        still in the tree). Returns the length held."""
         prev = self.pin_table.get(successor_rid)
-        degraded: List[str] = []
-        if via_valve:
-            refusal, degraded, fit = self._jc_make_room(rid=successor_rid, node=node)
-        else:
-            refusal = self._jc_pin_cap_refusal(rid=successor_rid, node=node)
-            fit = None
-            if refusal is not None and self.jc_pin_overflow == "lru":
-                fit = self._jc_page_floor(
-                    self._jc_longest_fit(rid=successor_rid, node=node)
-                )
-                if fit > 0:
-                    refusal = None
+        refusal = self._jc_pin_cap_refusal(rid=successor_rid, node=node)
+        fit = None
+        if refusal is not None and self.jc_pin_overflow == "lru":
+            fit = self._jc_page_floor(
+                self._jc_longest_fit(rid=successor_rid, node=node)
+            )
+            if fit > 0:
+                refusal = None
         if refusal is not None:
             logger.info(
                 f"joint-checkpoint: truncate of rid={cut_rid} takes no hold "
@@ -6643,11 +6646,10 @@ class Scheduler(
         )
         if prev is not None:
             self.tree_cache.unlock(prev.lock)
-        if fit is not None or degraded:
+        if fit is not None:
             logger.info(
                 f"joint-checkpoint: truncate of rid={cut_rid} holds {length} "
-                f"for successor rid={successor_rid} under pin pressure "
-                f"(degraded={degraded})"
+                f"for successor rid={successor_rid} under pin pressure"
             )
         return length
 
@@ -6657,6 +6659,18 @@ class Scheduler(
         pin = self.pin_table.get(req.rid)
         if pin is None or pin.successor_of is None:
             return
+        if why == "admitted":
+            # The hold kept [0, pinned_len) from eviction, so the admission
+            # match must reach it (up to the cut and the input's last token).
+            reachable = min(
+                pin.pinned_len, req.jc_truncated_at, len(req.origin_input_ids) - 1
+            )
+            if req.prefix_len < self._jc_page_floor(reachable):
+                logger.warning(
+                    f"joint-checkpoint: successor rid={req.rid} admitted with a "
+                    f"{req.prefix_len}-token prefix under a {pin.pinned_len}-token "
+                    f"truncate hold (cut at {req.jc_truncated_at})"
+                )
         del self.pin_table[req.rid]
         self.tree_cache.unlock(pin.lock)
         logger.debug(
@@ -6753,6 +6767,26 @@ class Scheduler(
             f"streak={self._jc_admit_first_streak}"
         )
         return picked
+
+    def _jc_exclusive_admits(self, req: Req, admitted: List[Req]) -> bool:
+        """Whether ``req``, prefix-matched for admission, still fits the
+        exclusive admit-first step: its actual extend (the prefix it reuses
+        now, not the cut estimated at intake) plus the successors already in
+        the batch within --jc-admit-first-max-tokens. A prefix lost to
+        eviction since intake makes the step refuse it: its jc_truncate_pos
+        becomes the matched length, so the estimate keeps it out of later
+        exclusive steps and normal (chunked) admission takes it."""
+        extend = len(req.full_untruncated_fill_ids) - req.prefix_len
+        taken = sum(len(r.full_untruncated_fill_ids) - r.prefix_len for r in admitted)
+        if taken + extend <= self.jc_admit_first_max_tokens:
+            return True
+        logger.info(
+            f"joint-checkpoint: successor rid={req.rid} reuses {req.prefix_len} "
+            f"tokens at admission (held at intake up to {req.jc_truncate_pos}); "
+            f"its {extend}-token extend leaves the exclusive admit-first step"
+        )
+        req.jc_truncate_pos = req.prefix_len
+        return False
 
     def _jc_appended_tokens(self, req: Req) -> int:
         """Prefill tokens a successor needs, estimated before its prefix

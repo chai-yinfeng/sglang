@@ -1442,14 +1442,18 @@ class TestJointCheckpointTruncateDegraded(_PinOnFinishFixture):
         self.assertIsNone(err)
         self.assertEqual((succ.jc_truncated_at, succ.jc_truncate_pos), (12, 12))
         self.assertNotIn("a", s.jc_degraded_pins)
+        # The successor hold degrades nobody: b and c keep 32 of the 40-token
+        # cap, so it holds the 8 that fit.
         hold = s.pin_table["succ"]
-        self.assertEqual((hold.pinned_len, hold.successor_of), (12, "a"))
-        # Held through the valve: 32 + 12 > 40 degraded b, the oldest pin.
-        self.assertEqual(set(s.jc_degraded_pins), {"b"})
+        self.assertEqual((hold.pinned_len, hold.successor_of), (8, "a"))
+        self.assertEqual(s.jc_degraded_pins, {})
+        self.assertEqual(set(s.pin_table), {"b", "c", "succ"})
         self.assertEqual(s._jc_appended_tokens(succ), 3)
         streamer.stream_output([succ], False)
         payload = streamer.send_to_detokenizer.send_output.call_args[0][0]
-        self.assertEqual(payload.jc_pin_outcomes, [{"jc_truncated_at": 12}])
+        self.assertEqual(
+            payload.jc_pin_outcomes, [{"jc_truncated_at": 12, "jc_successor_held": 8}]
+        )
         self.admit(s, succ)
         self.assertEqual(succ.prefix_len, 12)
         self.assertNotIn("succ", s.pin_table)
@@ -1487,6 +1491,53 @@ class TestJointCheckpointTruncateDegraded(_PinOnFinishFixture):
             "input_ids differ from the pinned path of request a at position 0", err
         )
         self.assertIn("a", s.jc_degraded_pins)
+
+    def test_full_cap_takes_no_hold_degrades_nobody_and_still_truncates(self):
+        """(a) b and c fill the 32-token cap: the successor gets no hold and no
+        pin is degraded for it; the truncate is accepted all the same."""
+        s = self.degraded_a()
+        s.jc_pin_max_ratio = 0.125  # limit 32 = b + c
+        succ, err = self.successor(s, 12)
+        self.assertIsNone(err)
+        self.assertEqual((succ.jc_truncated_at, succ.jc_successor_held), (12, 0))
+        self.assertEqual(set(s.pin_table), {"b", "c"})
+        self.assertEqual(s.jc_degraded_pins, {})
+        self.assertEqual(s.jc_pins_degraded_total, 1)  # a, by c's hold earlier
+
+    def test_unheld_prefix_evicted_before_admission_is_recomputed(self):
+        """(b) Nothing held the cut prefix and eviction took it before
+        admission: the successor reuses what the match finds (here nothing),
+        and the exclusive admit-first step judges its actual extend, not the
+        cut estimated at intake."""
+        s = self.degraded_a()
+        s.jc_pin_max_ratio = 0.125
+        s.jc_admit_first_max_tokens = 8
+        succ, err = self.successor(s, 12)
+        self.assertIsNone(err)
+        self.assertEqual(s._jc_appended_tokens(succ), 3)  # estimate at intake
+        self.evict_all()
+        succ.init_next_round_input(self.cache)
+        self.assertEqual(succ.prefix_len, 0)  # cached_tokens at the first extend
+        self.assertLess(succ.prefix_len, succ.jc_truncated_at)
+        self.assertFalse(s._jc_exclusive_admits(succ, []))
+        self.assertEqual(succ.jc_truncate_pos, 0)
+        self.assertEqual(s._jc_appended_tokens(succ), 15)
+
+    def test_inflight_successor_without_hold_falls_back_the_same_way(self):
+        """(c) The in-flight cut over a full cap: no successor hold, the
+        truncate stands, and admission reuses whatever is left."""
+        old = self.start("old", PROMPT, OUTPUT)
+        s = self.make_scheduler([old], max_ratio=0.003, overflow="lru")  # limit 0
+        s.jc_admit_first_max_tokens = 8
+        succ, err = self.truncate(s, "old", 12, append=(900, 901, 902))
+        self.assertIsNone(err)
+        self.assertEqual((succ.jc_truncated_at, succ.jc_successor_held), (12, 0))
+        self.assertNotIn("succ", s.pin_table)
+        self.evict_all()
+        succ.init_next_round_input(self.cache)
+        self.assertEqual(succ.prefix_len, 0)
+        self.assertFalse(s._jc_exclusive_admits(succ, []))
+        self.assertEqual(s._jc_appended_tokens(succ), 15)
 
     def test_repinned_flag(self):
         s = self.degraded_a()
@@ -1535,13 +1586,20 @@ CHUNK = 8192
 class _AdmReq:
     """The fields _get_new_batch_prefill_raw and the admit-first hooks read."""
 
-    def __init__(self, rid, n_input=6000, admit_first=False, truncate_pos=None):
+    def __init__(
+        self, rid, n_input=6000, admit_first=False, truncate_pos=None, matched=None
+    ):
         self.rid = rid
         self.origin_input_ids = array("q", range(n_input))
+        self.full_untruncated_fill_ids = self.origin_input_ids
         self.jc_admit_first = admit_first
         self.jc_truncate_pos = truncate_pos
+        self.jc_truncated_at = truncate_pos
+        # Prefix length the admission match finds (default: all that is held).
+        self.matched = matched
+        self.prefix_len = 0
         self.session = None
-        self.kv = SimpleNamespace(holds_kv=False)
+        self.kv = SimpleNamespace(holds_kv=False, holds_mamba=False)
         self.beam_group = None
         self.token_indices_to_pool = None
         self.inflight_middle_chunks = 0
@@ -1549,6 +1607,10 @@ class _AdmReq:
 
     def init_next_round_input(self, tree_cache=None):
         self.next_round_inits += 1
+        if self.matched is not None:
+            self.prefix_len = self.matched
+        elif self.jc_truncate_pos is not None:
+            self.prefix_len = min(self.jc_truncate_pos, len(self.origin_input_ids) - 1)
 
     def __repr__(self):
         return self.rid
@@ -1842,6 +1904,22 @@ class TestJointCheckpointAdmitFirstExclusive(CustomTestCase):
         self.assertEqual(self.unlocked, ["lock-a", "lock-b"])
 
     # ------------------------------------------------------------ flag off
+
+    def test_exclusive_step_judges_the_prefix_matched_at_admission(self):
+        """A successor estimated at 16 appended tokens whose held prefix was
+        partly evicted (the match finds 1000 of 4000) leaves the exclusive
+        step: nothing is admitted unchunked, its estimate becomes the matched
+        prefix, and the next round admits it normally, with chunking."""
+        cold = _AdmReq("c0")
+        succ = _AdmReq(
+            "s1", n_input=4016, admit_first=True, truncate_pos=4000, matched=1000
+        )
+        s = self.make_scheduler([cold, succ])
+        self.assertIsNone(self.admit(s))
+        self.assertEqual(succ.jc_truncate_pos, 1000)
+        reqs, _, chunk_size = self.admit(s)
+        self.assertEqual(reqs, [succ, cold])
+        self.assertEqual(chunk_size, CHUNK)
 
     def test_flag_off_admits_like_unmarked_requests(self):
         def run(enable, marked):

@@ -541,7 +541,11 @@ class _GenerationStreamAccumulator:
         self.retraction_counts.append(req.retraction_count)
         jc_meta = req.jc_pin_outcome if req.finished() else None
         if req.jc_truncated_at is not None:
-            jc_meta = {"jc_truncated_at": req.jc_truncated_at, **(jc_meta or {})}
+            jc_meta = {
+                "jc_truncated_at": req.jc_truncated_at,
+                "jc_successor_held": req.jc_successor_held,
+                **(jc_meta or {}),
+            }
         self.jc_pin_outcomes.append(jc_meta)
         if req.finished():
             self.weight_versions.append(

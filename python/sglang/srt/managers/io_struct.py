@@ -1822,8 +1822,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Joint checkpoint fields merged into a row's meta_info: the pin-on-finish
     # outcome on the final chunk ({"jc_pinned_len": int[, "jc_pin_message":
     # str][, "jc_pin_degraded": [rid]]}) and, on every chunk of a truncate
-    # successor, {"jc_truncated_at": int}. None entries elsewhere; the whole
-    # field is None when no row has one.
+    # successor, {"jc_truncated_at": int, "jc_successor_held": int}. None
+    # entries elsewhere; the whole field is None when no row has one.
     jc_pin_outcomes: Optional[List[Optional[Dict[str, Any]]]] = None
 
 

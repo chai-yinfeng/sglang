@@ -1210,6 +1210,9 @@ class Req(ReqDllmMixin):
         # The position a truncate actually cut at (its truncate pos, or less
         # when a degraded pin's KV was partly evicted); streamed in meta_info.
         self.jc_truncated_at: Optional[int] = None
+        # Tokens of the cut prefix held for it by a truncate hold at intake
+        # (0: none; a live client pin it was cut from is not counted).
+        self.jc_successor_held: int = 0
         # Joint checkpoint pin-on-finish. jc_finish_hold is the scheduler's
         # hook, which release_kv_cache calls once it has written the finished
         # request's KV into the tree and before the request's own lock goes;
