@@ -11,10 +11,13 @@ from queue import Queue
 from typing import (
     TYPE_CHECKING,
     Callable,
+    Dict,
     Iterator,
+    List,
     NamedTuple,
     Optional,
     Sequence,
+    Tuple,
     TypeVar,
 )
 
@@ -3968,14 +3971,22 @@ class UnifiedRadixCache(BasePrefixCache):
     def union_path_tokens(self, nodes: Sequence[NodeId]) -> int:
         # Read off the current tree, so a split of a node on a path between
         # two calls changes nothing: both halves stay on that path.
+        return sum(self.union_path_spans(nodes).values())
+
+    def union_path_spans(self, nodes: Sequence[NodeId]) -> Dict[NodeId, int]:
         if self.disable or not nodes:
-            return 0
-        spans = {
+            return {}
+        return {
             info.node_id: info.path_end - info.path_start
             for path in self.tree_core.collect_path_info(nodes)
             for info in path
         }
-        return sum(spans.values())
+
+    def path_spans(self, node: NodeId) -> List[Tuple[NodeId, int, int]]:
+        if self.disable:
+            return []
+        (path,) = self.tree_core.collect_path_info([node])
+        return [(info.node_id, info.path_start, info.path_end) for info in path]
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""

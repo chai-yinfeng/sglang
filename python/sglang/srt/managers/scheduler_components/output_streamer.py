@@ -539,7 +539,10 @@ class _GenerationStreamAccumulator:
         self.video_tokens.append(video_t)
 
         self.retraction_counts.append(req.retraction_count)
-        self.jc_pin_outcomes.append(req.jc_pin_outcome if req.finished() else None)
+        jc_meta = req.jc_pin_outcome if req.finished() else None
+        if req.jc_truncated_at is not None:
+            jc_meta = {"jc_truncated_at": req.jc_truncated_at, **(jc_meta or {})}
+        self.jc_pin_outcomes.append(jc_meta)
         if req.finished():
             self.weight_versions.append(
                 compute_weight_version_spans(

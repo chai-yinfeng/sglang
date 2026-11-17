@@ -34,6 +34,10 @@ real Req objects.
   --jc-pin-overflow lru a pin over the cap degrades other pins, least
   recently touched first and only those whose release makes room; a pin that
   cannot fit is refused with nothing degraded; refuse mode is unchanged.
+- Partial holds (TestJointCheckpointPartialHold): under lru a hold that
+  cannot fit whole holds its longest prefix that does, on every hold path.
+- Truncate of a degraded pin (TestJointCheckpointTruncateDegraded): cut at
+  what of its path is left in the tree, reported as jc_truncated_at.
 """
 
 import itertools
@@ -1244,7 +1248,7 @@ class TestJointCheckpointPinPressureValve(_PinOnFinishFixture):
     def test_infeasible_pin_is_refused_with_nothing_degraded(self):
         s = self.make_scheduler(max_ratio=0.16, overflow="lru")
         self.held_at(s, "a", 0, 1000.0)
-        s.jc_pin_max_ratio = 0.05  # limit 12: a 16-token pin cannot fit alone
+        s.jc_pin_max_ratio = 0.003  # limit 0: not even a prefix of a pin fits
         b = self.start("b", self.prompt(1), OUTPUT)
         s.running_batch.reqs = s.running_batch.reqs + [b]
         out = s.pin_request(PinReqInput(rid="b"))
@@ -1319,6 +1323,159 @@ class TestJointCheckpointPinPressureValve(_PinOnFinishFixture):
         s._jc_on_step(ScheduleBatch(reqs=[], batch_is_full=False))
         out = s.pin_request(PinReqInput(rid="b"))
         self.assertEqual(out.message, "request b is not running")
+
+
+class TestJointCheckpointPartialHold(_PinOnFinishFixture):
+    """--jc-pin-overflow lru: a hold that does not fit under the cap even with
+    every other pin degraded holds its longest page-aligned prefix that does,
+    on every hold path; only a zero-length fit is refused."""
+
+    def prompt(self, k):
+        return [p + 1000 * (k + 1) for p in PROMPT]
+
+    def test_pin_request_holds_the_prefix_that_fits(self):
+        s = self.make_scheduler(max_ratio=0.16, overflow="lru")
+        a = self.armed(s, "a", prompt=self.prompt(0))
+        self.finish(a)
+        s.jc_pin_max_ratio = 0.05  # limit 12 < 16
+        b = self.start("b", self.prompt(1), OUTPUT)
+        s.running_batch.reqs = s.running_batch.reqs + [b]
+        out = s.pin_request(PinReqInput(rid="b"))
+        self.assertTrue(out.success, out.message)
+        self.assertEqual((out.pinned_len, out.degraded), (12, ["a"]))
+        self.assertEqual(
+            out.message, "partial hold: 12 of 16 tokens fit under --jc-pin-max-ratio"
+        )
+        self.assertEqual(
+            (out.pinned_tokens_total, s.pin_table["b"].pinned_len), (12, 12)
+        )
+
+    def test_pin_on_finish_holds_the_prefix_that_fits(self):
+        s = self.make_scheduler(max_ratio=0.05, overflow="lru")  # limit 12
+        old = self.armed(s, "old")
+        self.finish(old)
+        self.assertEqual(
+            old.jc_pin_outcome,
+            {
+                "jc_pinned_len": 12,
+                "jc_pin_message": "partial hold: 12 of 16 tokens fit under --jc-pin-max-ratio",
+            },
+        )
+        # The hold ends at 12 exactly: the rest is evictable.
+        self.evict_all()
+        self.assertEqual(self.match_len(FILL), 12)
+
+    def test_repin_of_a_degraded_pin_holds_the_prefix_that_fits(self):
+        s = self.make_scheduler(max_ratio=0.16, overflow="lru")
+        self.now = 1000.0
+        a = self.armed(s, "a")
+        self.finish(a)
+        s._jc_degrade_pin("a")
+        s.jc_pin_max_ratio = 0.05
+        out = s.pin_request(PinReqInput(rid="a"))
+        self.assertTrue(out.success, out.message)
+        self.assertEqual((out.pinned_len, out.repinned), (12, True))
+        self.assertIn("partial hold: 12 of 16", out.message)
+        self.evict_all()
+        self.assertEqual(self.match_len(FILL), 12)
+
+    def test_truncate_successor_hold_holds_the_prefix_that_fits(self):
+        old = self.start("old", PROMPT, OUTPUT)
+        s = self.make_scheduler([old], max_ratio=0.05, overflow="lru")
+        succ, err = self.truncate(s, "old", len(FILL), prefix=FILL, append=(900,))
+        self.assertIsNone(err)
+        self.assertEqual(s.pin_table["succ"].pinned_len, 12)
+        self.assertEqual(succ.jc_truncated_at, len(FILL))
+        self.evict_all()
+        self.assertEqual(self.match_len(FILL), 12)
+
+
+class TestJointCheckpointTruncateDegraded(_PinOnFinishFixture):
+    """Truncate of a finished request whose pin the valve degraded: the cut is
+    what of its pinned path, up to pos, is still in the tree; the successor
+    gets a hold through the valve and recomputes the rest."""
+
+    def prompt(self, k):
+        return [p + 1000 * (k + 1) for p in PROMPT]
+
+    def degraded_a(self):
+        """a, b, c hold 16 tokens each (limit 40): c's hold degraded a."""
+        s = self.make_scheduler(max_ratio=0.16, overflow="lru")
+        for k, rid in enumerate("abc"):
+            self.now = 1000.0 + k
+            req = self.armed(s, rid, prompt=self.prompt(k))
+            self.finish(req)
+        s.running_batch.filter_batch()
+        self.assertEqual(set(s.jc_degraded_pins), {"a"})
+        return s
+
+    def successor(self, s, pos, append=(900, 901, 902)):
+        a_fill = self.prompt(0) + OUTPUT
+        succ = make_req("succ", a_fill[:pos] + list(append))
+        return succ, s._jc_truncate(succ, recv_for("succ", "a", pos))
+
+    def test_cut_at_pos_when_the_path_survived(self):
+        streamer = self.real_streamer()
+        s = self.degraded_a()
+        s.output_streamer = streamer
+        succ, err = self.successor(s, 12)
+        self.assertIsNone(err)
+        self.assertEqual((succ.jc_truncated_at, succ.jc_truncate_pos), (12, 12))
+        self.assertNotIn("a", s.jc_degraded_pins)
+        hold = s.pin_table["succ"]
+        self.assertEqual((hold.pinned_len, hold.successor_of), (12, "a"))
+        # Held through the valve: 32 + 12 > 40 degraded b, the oldest pin.
+        self.assertEqual(set(s.jc_degraded_pins), {"b"})
+        self.assertEqual(s._jc_appended_tokens(succ), 3)
+        streamer.stream_output([succ], False)
+        payload = streamer.send_to_detokenizer.send_output.call_args[0][0]
+        self.assertEqual(payload.jc_pin_outcomes, [{"jc_truncated_at": 12}])
+        self.admit(s, succ)
+        self.assertEqual(succ.prefix_len, 12)
+        self.assertNotIn("succ", s.pin_table)
+
+    def test_cut_moves_back_to_what_eviction_left(self):
+        s = self.degraded_a()
+        # Something else holds a's prompt; eviction takes a's output tokens.
+        prompt_node = self.cache.match_prefix(
+            MatchPrefixParams(key=RadixKey(array("q", self.prompt(0))))
+        ).last_device_node
+        other = self.cache.lock(prompt_node)
+        self.evict_all()
+        succ, err = self.successor(s, 14)
+        self.assertIsNone(err)
+        self.assertEqual((succ.jc_truncated_at, succ.jc_truncate_pos), (10, 10))
+        # The admit-first budget counts the recomputed [10, 14) too.
+        self.assertEqual(s._jc_appended_tokens(succ), 14 + 3 - 10)
+        self.admit(s, succ)
+        self.assertEqual(succ.prefix_len, 10)
+        self.cache.unlock(other)
+
+    def test_nothing_left_cuts_at_zero_and_a_foreign_path_is_refused(self):
+        s = self.degraded_a()
+        self.evict_all()
+        succ, err = self.successor(s, 12)
+        self.assertIsNone(err)
+        self.assertEqual((succ.jc_truncated_at, succ.jc_truncate_pos), (0, 0))
+        self.assertNotIn("succ", s.pin_table)
+        self.assertNotIn("a", s.jc_degraded_pins)
+        # A successor whose input is not the degraded pin's path is rejected.
+        s = self.degraded_a()
+        bad = make_req("bad", [7] * 12 + [900])
+        err = s._jc_truncate(bad, recv_for("bad", "a", 12))
+        self.assertIn(
+            "input_ids differ from the pinned path of request a at position 0", err
+        )
+        self.assertIn("a", s.jc_degraded_pins)
+
+    def test_repinned_flag(self):
+        s = self.degraded_a()
+        out = s.pin_request(PinReqInput(rid="b"))
+        self.assertTrue(out.success)
+        self.assertFalse(out.repinned)
+        out = s.pin_request(PinReqInput(rid="a"))
+        self.assertTrue(out.success, out.message)
+        self.assertTrue(out.repinned)
 
 
 class TestJointCheckpointPinPressureValveShared(_SharedPrefixFixture):

@@ -8,6 +8,8 @@ from typing import (
     TYPE_CHECKING,
     Any,
     Callable,
+    Dict,
+    List,
     NamedTuple,
     Optional,
     Protocol,
@@ -563,6 +565,16 @@ class BasePrefixCache(ABC, PrefixCacheTrait):
     def union_path_tokens(self, nodes: Sequence[Any]) -> int:
         """Tokens on the union of the root-to-node paths of ``nodes``: a node
         shared by several paths counts once."""
+        raise NotImplementedError
+
+    def union_path_spans(self, nodes: Sequence[Any]) -> Dict[Any, int]:
+        """The nodes on the union of the root-to-node paths of ``nodes``,
+        each with its length in tokens."""
+        raise NotImplementedError
+
+    def path_spans(self, node: Any) -> List[Tuple[Any, int, int]]:
+        """(node, start, end) of each node on the root-to-``node`` path, root
+        excluded, in path order; start and end are token offsets."""
         raise NotImplementedError
 
     def prefix_device_indices(self, req: Req) -> torch.Tensor:

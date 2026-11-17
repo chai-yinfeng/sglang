@@ -60,6 +60,7 @@ class _FakeReq:
         self.finished_len = None
         self.beam_group = None
         self.jc_pin_outcome = None
+        self.jc_truncated_at = None
         self.stream = False
         self.sampling_params = SimpleNamespace(
             stream_interval=None,

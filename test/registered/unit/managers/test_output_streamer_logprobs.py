@@ -18,6 +18,7 @@ class _FakeReq:
         self.finished_reason = None
         self.finished_output = False
         self.finished_len = None
+        self.jc_truncated_at = None
         self.stream = False
         self.sampling_params = SimpleNamespace(
             max_new_tokens=max_new_tokens,

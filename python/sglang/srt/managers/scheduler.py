@@ -6345,9 +6345,12 @@ class Scheduler(
           (_jc_truncate_inflight).
         - It already finished: the scheduler no longer has its ledger, so only
           a /pin_request hold on its rid covering ``pos`` vouches for the KV
-          (_jc_truncate_pinned). The pin is left as it is.
+          (_jc_truncate_pinned). The pin is left as it is. If that hold was
+          degraded under pin pressure, the cut moves back to what of its path
+          is still in the tree (_jc_truncate_degraded).
         Truncate only acts on KV known to exist: an in-flight request holds
-        its own, a finished one's must be pinned.
+        its own, a finished one's must be pinned. The position actually cut
+        at is req.jc_truncated_at (reported to the client).
         """
         old_rid, pos = recv_req.truncate.rid, recv_req.truncate.pos
         if not self.enable_joint_checkpoint:
@@ -6369,16 +6372,21 @@ class Scheduler(
         old = self._find_inflight_req(old_rid)
         if old is None and any(r.rid == old_rid for r in self.waiting_queue):
             return f"request {old_rid} has not finished prefill"
+        cut = pos
         if old is None or old.finished():
-            error_msg = self._jc_truncate_pinned(old_rid, pos, req.rid)
+            if old_rid not in self.pin_table and old_rid in self.jc_degraded_pins:
+                error_msg, cut = self._jc_truncate_degraded(old_rid, pos, req)
+            else:
+                error_msg = self._jc_truncate_pinned(old_rid, pos, req.rid)
         else:
             error_msg = self._jc_truncate_inflight(old, req, pos)
         if error_msg is not None:
             return error_msg
-        # Its prefix is in the tree; only the appended tokens need prefill
+        # Its prefix up to the cut is in the tree; only the rest needs prefill
         # budget, so it goes ahead of the waiting queue.
         req.jc_admit_first = True
-        req.jc_truncate_pos = pos
+        req.jc_truncate_pos = cut
+        req.jc_truncated_at = cut
         return None
 
     def _jc_truncate_pinned(
@@ -6402,6 +6410,48 @@ class Scheduler(
             f"via its pin (len={pin.pinned_len}); successor rid={successor_rid}"
         )
         return None
+
+    def _jc_truncate_degraded(
+        self, old_rid: str, pos: int, req: Req
+    ) -> Tuple[Optional[str], int]:
+        """Truncate of a finished request whose pin the pressure valve degraded:
+        returns (error, cut). The cut is the longest prefix of the degraded
+        hold's path, up to ``pos``, still in the tree (eviction may have taken
+        its tail; the successor recomputes from there, 0 if nothing is left).
+        The degraded record is consumed; the cut prefix is held for the
+        successor through the valve, as a new pin would be."""
+        rec = self.jc_degraded_pins[old_rid]
+        if (req.extra_key, req.cache_salt) != (rec.key.extra_key, rec.key.cache_salt):
+            return (
+                f"request {req.rid} is not in the cache namespace (extra_key, "
+                f"cache_salt, LoRA) of request {old_rid}"
+            ), 0
+        want = min(pos, rec.pinned_len)
+        path, ids = list(rec.key.token_ids[:want]), list(req.origin_input_ids[:want])
+        if path != ids:
+            first = next(i for i in range(want) if path[i] != ids[i])
+            return (
+                f"input_ids differ from the pinned path of request {old_rid} at "
+                f"position {first} (truncate pos={pos})"
+            ), 0
+        cut, node = self._jc_prefix_node(rec.key, want)
+        del self.jc_degraded_pins[old_rid]
+        held = 0
+        if cut > 0:
+            held = self._jc_successor_hold(
+                cut_rid=old_rid,
+                successor_rid=req.rid,
+                node=node,
+                length=cut,
+                key=rec.key,
+                via_valve=True,
+            )
+        logger.info(
+            f"joint-checkpoint: truncate of finished rid={old_rid} at pos={pos} "
+            f"via its degraded pin (len={rec.pinned_len}): cut at {cut}, held "
+            f"{held} for successor rid={req.rid}"
+        )
+        return None, cut
 
     def _jc_truncate_inflight(self, old: Req, req: Req, pos: int) -> Optional[str]:
         """Truncate of a running or paused request: validate, then cut it."""
@@ -6497,35 +6547,80 @@ class Scheduler(
 
     def _jc_hold_for_successor(self, old: Req, successor_rid: str, kept: int) -> None:
         """Lock the node ending the cut prefix [0, kept) on behalf of the
-        request that continues ``old``, keyed by its rid in pin_table with a
-        JC_TRUNCATE_HOLD_TTL_S backstop, so nothing evicts the prefix before
-        that request is admitted and locks it itself
-        (_jc_release_truncate_hold). Counts against --jc-pin-max-ratio; over
-        the cap the truncate goes ahead without the hold."""
+        request that continues ``old`` (_jc_successor_hold), outside the
+        pressure valve: over --jc-pin-max-ratio the truncate goes ahead with a
+        shorter hold (--jc-pin-overflow lru) or none."""
         if kept <= 0 or old.last_node is None:
             return
+        self._jc_successor_hold(
+            cut_rid=old.rid,
+            successor_rid=successor_rid,
+            node=old.last_node,
+            length=kept,
+            key=self._jc_pin_key(old, kept),
+            via_valve=False,
+        )
+
+    def _jc_successor_hold(
+        self,
+        *,
+        cut_rid: str,
+        successor_rid: str,
+        node: Any,
+        length: int,
+        key: RadixKey,
+        via_valve: bool,
+    ) -> int:
+        """Hold [0, length) of the path ``key`` (ending at ``node``) for the
+        request that continues ``cut_rid``, keyed by its rid in pin_table with
+        a JC_TRUNCATE_HOLD_TTL_S backstop, so nothing evicts the prefix before
+        that request is admitted and locks it itself
+        (_jc_release_truncate_hold). Over the cap: through the valve
+        (``via_valve``) other pins may be degraded; a prefix that still does
+        not fit is held as far as it fits (lru) or not at all. Returns the
+        length held."""
         prev = self.pin_table.get(successor_rid)
-        refusal = self._jc_pin_cap_refusal(rid=successor_rid, node=old.last_node)
+        degraded: List[str] = []
+        if via_valve:
+            refusal, degraded, fit = self._jc_make_room(rid=successor_rid, node=node)
+        else:
+            refusal = self._jc_pin_cap_refusal(rid=successor_rid, node=node)
+            fit = None
+            if refusal is not None and self.jc_pin_overflow == "lru":
+                fit = self._jc_page_floor(
+                    self._jc_longest_fit(rid=successor_rid, node=node)
+                )
+                if fit > 0:
+                    refusal = None
         if refusal is not None:
             logger.info(
-                f"joint-checkpoint: truncate of rid={old.rid} takes no hold "
+                f"joint-checkpoint: truncate of rid={cut_rid} takes no hold "
                 f"for successor rid={successor_rid}: {refusal}; the successor "
                 f"locks the prefix when admitted"
             )
-            return
-        lock = self.tree_cache.lock(old.last_node)
+            return 0
+        if fit is not None and fit < length:
+            length, node = self._jc_prefix_node(key, fit)
+        lock = self.tree_cache.lock(node)
         if lock is None:
-            return
+            return 0
         now = time.monotonic()
         self.pin_table[successor_rid] = JcPin(
             lock=lock,
-            pinned_len=kept,
+            pinned_len=length,
             pinned_at=now,
             expires_at=now + self.JC_TRUNCATE_HOLD_TTL_S,
-            successor_of=old.rid,
+            successor_of=cut_rid,
         )
         if prev is not None:
             self.tree_cache.unlock(prev.lock)
+        if fit is not None or degraded:
+            logger.info(
+                f"joint-checkpoint: truncate of rid={cut_rid} holds {length} "
+                f"for successor rid={successor_rid} under pin pressure "
+                f"(degraded={degraded})"
+            )
+        return length
 
     def _jc_release_truncate_hold(self, req: Req, why: str) -> None:
         """Drop the truncate hold kept for ``req`` (admitted with its own tree
@@ -6675,7 +6770,8 @@ class Scheduler(
             up_to = min(up_to, recv_req.up_to)
         # Checked before anything touches the tree: the hold will cover the
         # path to last_node plus at most the tokens checkpoint adds past it.
-        refusal, degraded = self._jc_make_room(
+        want = max(up_to, req.kv.cache_protected_len)
+        refusal, degraded, fit = self._jc_make_room(
             rid=rid,
             node=req.last_node,
             extra_tokens=max(up_to - req.kv.cache_protected_len, 0),
@@ -6689,16 +6785,22 @@ class Scheduler(
                 pins_degraded_total=self.jc_pins_degraded_total,
                 pins_repinned_total=self.jc_pins_repinned_total,
             )
-        if up_to > req.kv.cache_protected_len:
-            # checkpoint page-aligns the insert and moves req.lock / req.last_node
-            # to the node it ended on.
-            self.tree_cache.checkpoint(req, up_to=up_to)
-        # [0, cache_protected_len) is already in the tree, ending at last_node;
-        # a shorter up_to is covered by holding that node.
-        pinned_len = req.kv.cache_protected_len
+        if fit is not None and fit < req.kv.cache_protected_len:
+            # Partial hold inside the request's tree path: hold the node there.
+            pinned_len, node = self._jc_prefix_node(self._jc_pin_key(req, fit), fit)
+        else:
+            if fit is not None:
+                up_to = fit
+            if up_to > req.kv.cache_protected_len:
+                # checkpoint page-aligns the insert and moves req.lock /
+                # req.last_node to the node it ended on.
+                self.tree_cache.checkpoint(req, up_to=up_to)
+            # [0, cache_protected_len) is already in the tree, ending at
+            # last_node; a shorter up_to is covered by holding that node.
+            pinned_len, node = req.kv.cache_protected_len, req.last_node
         if not self._jc_take_hold(
             rid=rid,
-            node=req.last_node,
+            node=node,
             pinned_len=pinned_len,
             ttl_s=ttl_s,
             key=self._jc_pin_key(req, pinned_len),
@@ -6712,6 +6814,8 @@ class Scheduler(
                 pins_repinned_total=self.jc_pins_repinned_total,
             )
         out = self._jc_pin_output(pinned_len=pinned_len, ttl_s=ttl_s, degraded=degraded)
+        if fit is not None:
+            out.message = self._jc_partial_message(pinned_len, want)
         logger.info(
             f"joint-checkpoint: pinned rid={rid} len={pinned_len} "
             f"(requested up_to={recv_req.up_to}) expires_in_s={ttl_s} "
@@ -6784,14 +6888,17 @@ class Scheduler(
                 pins_degraded_total=self.jc_pins_degraded_total,
                 pins_repinned_total=self.jc_pins_repinned_total,
             )
-        refusal, degraded = self._jc_make_room(rid=rid, node=node)
+        refusal, degraded, fit = self._jc_make_room(rid=rid, node=node)
+        pinned_len = survived
+        if refusal is None and fit is not None and fit < survived:
+            pinned_len, node = self._jc_prefix_node(old.key, fit)
         if refusal is None and not self._jc_take_hold(
             rid=rid,
             node=node,
-            pinned_len=survived,
+            pinned_len=pinned_len,
             ttl_s=ttl_s,
             key=RadixKey(
-                old.key.token_ids[:survived],
+                old.key.token_ids[:pinned_len],
                 old.key.extra_key,
                 cache_salt=old.key.cache_salt,
             ),
@@ -6809,10 +6916,15 @@ class Scheduler(
             )
         self.jc_pins_repinned_total += 1
         logger.info(
-            f"joint-checkpoint: re-pinned degraded rid={rid} len={survived} "
-            f"of {old.pinned_len} expires_in_s={ttl_s} degraded={degraded}"
+            f"joint-checkpoint: re-pinned degraded rid={rid} len={pinned_len} "
+            f"of {old.pinned_len} (in tree {survived}) expires_in_s={ttl_s} "
+            f"degraded={degraded}"
         )
-        return self._jc_pin_output(pinned_len=survived, ttl_s=ttl_s, degraded=degraded)
+        out = self._jc_pin_output(pinned_len=pinned_len, ttl_s=ttl_s, degraded=degraded)
+        out.repinned = True
+        if fit is not None:
+            out.message = self._jc_partial_message(pinned_len, survived)
+        return out
 
     def _jc_pin_output(
         self, *, pinned_len: int, ttl_s: float, degraded: Sequence[str] = ()
@@ -6861,18 +6973,21 @@ class Scheduler(
 
     def _jc_make_room(
         self, *, rid: str, node: Any, extra_tokens: int = 0
-    ) -> Tuple[Optional[str], List[str]]:
+    ) -> Tuple[Optional[str], List[str], Optional[int]]:
         """Fit a hold of ``rid`` on the path to ``node`` (plus ``extra_tokens``)
-        under --jc-pin-max-ratio. Returns (refusal, degraded rids). Over the
-        cap, --jc-pin-overflow refuse refuses; lru degrades other client pins
-        and pin-on-finish holds, least recently touched (pinned_at) first,
-        until the hold fits, or refuses with nothing degraded when degrading
-        all of them would not make room. Truncate holds are never degraded."""
+        under --jc-pin-max-ratio. Returns (refusal, degraded rids, fit). Over
+        the cap, --jc-pin-overflow refuse refuses; lru degrades other client
+        pins and pin-on-finish holds, least recently touched (pinned_at)
+        first, until the hold fits. If it does not fit even with all of them
+        degraded, ``fit`` is the longest page-aligned prefix of the hold that
+        does (the caller holds only that), with only the pins that prefix
+        needs degraded; a zero-length fit refuses with nothing degraded.
+        Truncate holds are never degraded. ``fit`` is None for a whole hold."""
         refusal = self._jc_pin_cap_refusal(
             rid=rid, node=node, extra_tokens=extra_tokens
         )
         if refusal is None or self.jc_pin_overflow != "lru":
-            return refusal, []
+            return refusal, [], None
         limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
         candidates = sorted(
             (
@@ -6890,14 +7005,86 @@ class Scheduler(
             return held + extra_tokens <= limit
 
         victims = select_pins_to_degrade(candidates=candidates, fits=fits)
+        fit = None
         if victims is None:
-            return (
-                f"{refusal}; degrading every other pin would not make room",
-                [],
+            fit = self._jc_page_floor(
+                self._jc_longest_fit(
+                    rid=rid,
+                    node=node,
+                    extra_tokens=extra_tokens,
+                    degraded=frozenset(candidates),
+                )
             )
+            if fit <= 0:
+                return (
+                    f"{refusal}; degrading every other pin would not make room",
+                    [],
+                    None,
+                )
+
+            def prefix_fits(degraded: AbstractSet[str]) -> bool:
+                longest = self._jc_longest_fit(
+                    rid=rid, node=node, extra_tokens=extra_tokens, degraded=degraded
+                )
+                return self._jc_page_floor(longest) >= fit
+
+            victims = select_pins_to_degrade(candidates=candidates, fits=prefix_fits)
         for victim in victims:
             self._jc_degrade_pin(victim)
-        return None, victims
+        return None, victims, fit
+
+    def _jc_longest_fit(
+        self,
+        *,
+        rid: str,
+        node: Any,
+        extra_tokens: int = 0,
+        degraded: AbstractSet[str] = frozenset(),
+    ) -> int:
+        """Longest prefix of a hold's path (root to ``node``, then
+        ``extra_tokens`` tokens not in the tree yet) whose distinct tokens fit
+        under --jc-pin-max-ratio beside the other holds, without ``rid``'s own
+        and those in ``degraded``. Nodes the other holds already keep cost
+        nothing."""
+        limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
+        held = self.tree_cache.union_path_spans(
+            [
+                pin.lock.node
+                for other, pin in self.pin_table.items()
+                if other != rid and other not in degraded
+            ]
+        )
+        room = limit - sum(held.values())
+        fit = 0
+        for node_id, start, end in self.tree_cache.path_spans(node):
+            if node_id not in held:
+                if end - start > room:
+                    return start + max(room, 0)
+                room -= end - start
+            fit = end
+        return fit + min(extra_tokens, max(room, 0))
+
+    def _jc_page_floor(self, n: int) -> int:
+        return n // self.page_size * self.page_size
+
+    def _jc_prefix_node(self, key: RadixKey, length: int) -> Tuple[int, Any]:
+        """(matched length, node) for the first ``length`` tokens of the path
+        ``key``; the match splits a node there, so the hold ends exactly at
+        the (page-aligned) length when that prefix is in the tree."""
+        match = self.tree_cache.match_prefix(
+            MatchPrefixParams(
+                key=RadixKey(
+                    key.token_ids[:length], key.extra_key, cache_salt=key.cache_salt
+                )
+            )
+        )
+        return match.device_prefix_len, match.last_device_node
+
+    @staticmethod
+    def _jc_partial_message(pinned_len: int, want: int) -> str:
+        return (
+            f"partial hold: {pinned_len} of {want} tokens fit under --jc-pin-max-ratio"
+        )
 
     def _jc_degrade_pin(self, rid: str) -> None:
         """Drop a pin's lock to make room for a newer one. Its KV stays in the
@@ -7000,13 +7187,18 @@ class Scheduler(
         pinned_len = req.kv.cache_protected_len
         ttl_s = req.jc_pin_ttl_s if req.jc_pin_ttl_s is not None else self.jc_pin_ttl_s
         degraded: List[str] = []
+        fit = None
+        node = req.last_node
         if pinned_len <= 0:
             refusal = "no KV of the request is in the radix tree"
         else:
-            refusal, degraded = self._jc_make_room(rid=req.rid, node=req.last_node)
+            refusal, degraded, fit = self._jc_make_room(rid=req.rid, node=node)
+        want = pinned_len
+        if refusal is None and fit is not None and fit < pinned_len:
+            pinned_len, node = self._jc_prefix_node(self._jc_pin_key(req, fit), fit)
         if refusal is None and not self._jc_take_hold(
             rid=req.rid,
-            node=req.last_node,
+            node=node,
             pinned_len=pinned_len,
             ttl_s=ttl_s,
             key=self._jc_pin_key(req, pinned_len),
@@ -7014,6 +7206,11 @@ class Scheduler(
             refusal = "tree did not hand out a lock"
         if refusal is not None:
             req.jc_pin_outcome = {"jc_pinned_len": 0, "jc_pin_message": refusal}
+        elif fit is not None:
+            req.jc_pin_outcome = {
+                "jc_pinned_len": pinned_len,
+                "jc_pin_message": self._jc_partial_message(pinned_len, want),
+            }
         else:
             req.jc_pin_outcome = {"jc_pinned_len": pinned_len}
         if degraded:
