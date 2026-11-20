@@ -67,16 +67,17 @@ from sglang.srt.managers.schedule_batch import (
     Req,
     ScheduleBatch,
 )
-from sglang.srt.managers.schedule_policy import AddReqResult
+from sglang.srt.managers.schedule_policy import AddReqResult, PrefillAdder
 from sglang.srt.managers.scheduler import JcPin, Scheduler
 from sglang.srt.managers.scheduler_components.output_streamer import (
     SchedulerOutputStreamer,
 )
+from sglang.srt.mem_cache.allocation import alloc_token_slots
 from sglang.srt.mem_cache.allocator import TokenToKVPoolAllocator
 from sglang.srt.mem_cache.allocator.paged import PagedTokenToKVPoolAllocator
 from sglang.srt.mem_cache.base_prefix_cache import EvictParams, MatchPrefixParams
 from sglang.srt.mem_cache.cache_init_params import CacheInitParams
-from sglang.srt.mem_cache.common import release_kv_cache
+from sglang.srt.mem_cache.common import checkpoint_kv_cache, release_kv_cache
 from sglang.srt.mem_cache.memory_pool import MHATokenToKVPool, ReqToTokenPool
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.mem_cache.unified_cache.components import ComponentType
@@ -1626,6 +1627,14 @@ class _Adder:
         self.preempt_list = []
         self.new_chunked_req = None
         self.rem_chunk_tokens = self.chunked_prefill_size
+        self.memory_budget = SimpleNamespace(total_offset=0)
+        self.per_req_token_overhead = 1
+
+    def ceil_paged_tokens(self, tokens):
+        return tokens
+
+    def _get_running_request_total_token_offset(self, req):
+        return 0
 
     def add_chunked_req(self, req):
         self.can_run_list.append(req)
@@ -1943,6 +1952,138 @@ class TestJointCheckpointAdmitFirstExclusive(CustomTestCase):
         self.assertEqual(baseline, (["chunk", "c0", "s1", "c1"], "chunk", CHUNK, 1, []))
         self.assertEqual(run(enable=False, marked=True), baseline)
         self.assertEqual(run(enable=True, marked=False), baseline)
+
+
+class TestJointCheckpointExclusiveStepChunkedBudget(_TruncateFixture):
+    """The exclusive admit-first step with the real PrefillAdder over a real
+    pool while a chunked prefill is in flight. The chunked request's tail was
+    budgeted at its admission, partly against evictable KV; a successor whose
+    prefix is held only in part re-locks the unheld rest when admitted. The
+    step therefore budgets the chunked request's remaining need and leaves
+    out a successor that would make the tail chunk not fit."""
+
+    pool_size = 256
+    max_context_len = 256
+    OLD_FILL = list(range(1000, 1088)) + list(range(2000, 2008))  # 96 tokens
+    CHUNK_INPUT = list(range(3000, 3160))  # 160 tokens
+    FIRST_CHUNK = 40
+    CHUNK_SIZE = 128  # the 120-token tail fits in one chunk
+
+    def setUp(self):
+        super().setUp()
+        cm = get_context().override_server_args(pp_max_micro_batch_size=8)
+        cm.__enter__()
+        self.addCleanup(cm.__exit__, None, None, None)
+
+    def admission_scheduler(self, running):
+        # Limit int(16 / 256 x 256) = 16: a successor hold of 96 holds 16.
+        s = self.make_scheduler(running, max_ratio=16 / 256, overflow="lru")
+        s.jc_admit_first_max_tokens = 512
+        s._jc_admit_first_streak = 0
+        s.grammar_manager = SimpleNamespace(has_waiting_grammars=lambda: False)
+        s.enable_priority_preemption = False
+        s.is_hybrid_swa = False
+        s.min_free_slots_delayer = None
+        s.policy = MagicMock()
+        s.policy.shortest_prefill_chunk_limit.return_value = None
+        s.processed_tokens_counter = 0
+        s.chunked_prefill_size = self.CHUNK_SIZE
+        s.dynamic_chunk_sizer = None
+        s.tp_worker = SimpleNamespace(
+            model_runner=SimpleNamespace(attn_backend=SimpleNamespace())
+        )
+        s.get_prefill_adder_class = lambda: PrefillAdder
+        s.new_token_ratio_tracker = SimpleNamespace(current=0.5)
+        s.max_prefill_tokens = 1 << 20
+        s.is_mixed_chunk = False
+        s.priority_scheduling_preemption_threshold = 0
+        s.max_prefill_bs = 0
+        s.max_running_requests = 8
+        s.enable_lora = False
+        s.enable_hicache_storage = False
+        s.enable_lmcache = False
+        s.truncation_align_size = None
+        s.model_config = None
+        s.enable_overlap = False
+        s.beam_coordinator = SimpleNamespace(pending_member_rows=lambda batch: 0)
+        return s
+
+    def chunked(self, rid, input_ids, first_chunk, max_new_tokens):
+        """A request admitted as chunked whose first chunk ran and was
+        published by stash_chunked_request (locked in the tree, prefix_len at
+        the chunk end)."""
+        req = make_req(rid, input_ids)
+        req.sampling_params.max_new_tokens = max_new_tokens
+        req.init_next_round_input(self.cache)
+        req.lock = self.cache.lock(req.last_node)
+        pool = self.cache.req_to_token_pool
+        row = pool.alloc_rows(1)[0]
+        pool.write((row, slice(0, first_chunk)), self.allocator.alloc(first_chunk))
+        req.kv.req_pool_idx = row
+        req.kv.kv_committed_len = first_chunk
+        req.kv.kv_allocated_len = first_chunk
+        req.extend_end = first_chunk
+        checkpoint_kv_cache(req, self.cache)
+        return req
+
+    def prefill_round(self, s):
+        """One _get_new_batch_prefill_raw: (admitted reqs, init_new's
+        chunked_req), or None when no batch is built."""
+
+        def capture(can_run_list, *args, **kwargs):
+            raise _BatchBuilt(list(can_run_list), kwargs.get("chunked_req"))
+
+        with (
+            patch.object(ScheduleBatch, "init_new", side_effect=capture),
+            patch("sglang.srt.managers.scheduler.set_time_batch"),
+        ):
+            try:
+                s._get_new_batch_prefill_raw(
+                    prefill_delayer_single_pass=None, running_batch=s.running_batch
+                )
+            except _BatchBuilt as e:
+                return e.args
+        return None
+
+    def test_exclusive_step_keeps_room_for_the_chunked_tail(self):
+        old = self.start("old", self.OLD_FILL[:88], self.OLD_FILL[88:])
+        s = self.admission_scheduler([old])
+        succ, err = self.truncate(
+            s, "old", 96, prefix=self.OLD_FILL, append=(900, 901, 902, 903)
+        )
+        self.assertIsNone(err)
+        self.assertTrue(succ.jc_admit_first)
+        self.assertEqual(s.pin_table["succ"].pinned_len, 16)
+        s.running_batch.filter_batch()
+        chunk = self.chunked("chunk", self.CHUNK_INPUT, self.FIRST_CHUNK, 8)
+        s.chunked_req = chunk
+        s.waiting_queue = [succ]
+        tail = len(self.CHUNK_INPUT) - self.FIRST_CHUNK
+
+        # 96 tokens in the tree (16 held, 80 evictable), 40 of the chunk.
+        free = self.allocator.available_size()
+        self.assertEqual((free, self.cache.evictable_size()), (120, 80))
+        # Admitting the successor would lock the 80 unheld tokens and take
+        # 4 more: the 120-token tail would then have nowhere to go.
+        self.assertLess(free - 4, tail)
+
+        # Each exclusive step leaves the successor out, at the head of the
+        # queue with its hold, until a normal round runs the chunk.
+        for _ in range(Scheduler.JC_ADMIT_FIRST_MAX_CONSECUTIVE):
+            self.assertIsNone(self.prefill_round(s))
+            self.assertEqual(s.waiting_queue, [succ])
+            self.assertIn("succ", s.pin_table)
+            self.assertEqual(self.cache.evictable_size(), 80)
+            self.assertIs(s.chunked_req, chunk)
+        reqs, chunked_kw = self.prefill_round(s)
+        # The tail fits in this chunk; the successor still does not fit
+        # beside it and keeps waiting.
+        self.assertEqual(reqs, [chunk])
+        self.assertIsNone(chunked_kw)
+        self.assertEqual(chunk.extend_len, tail)
+        self.assertEqual(s.waiting_queue, [succ])
+        # The tail allocation succeeds (evicting the unheld prefix).
+        self.assertEqual(len(alloc_token_slots(self.cache, tail)), tail)
 
 
 if __name__ == "__main__":

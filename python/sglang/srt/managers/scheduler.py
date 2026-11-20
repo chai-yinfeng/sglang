@@ -4294,6 +4294,11 @@ class Scheduler(
             prefill_tile_block_m=prefill_tile_block_m,
         )
 
+        if jc_exclusive is not None and self.chunked_req is not None:
+            adder.memory_budget.total_offset += self._jc_chunked_req_remaining_tokens(
+                adder
+            )
+
         # An exclusive step leaves the chunked request out for one round; see
         # _jc_admit_first_exclusive.
         if self.chunked_req is not None and jc_exclusive is None:
@@ -6767,6 +6772,21 @@ class Scheduler(
             f"streak={self._jc_admit_first_streak}"
         )
         return picked
+
+    def _jc_chunked_req_remaining_tokens(self, adder: PrefillAdder) -> int:
+        """KV tokens self.chunked_req still needs (its remaining input, the
+        allocation page and its decode headroom), charged in an exclusive
+        admit-first step it sits out. Its admission budgeted that input partly
+        against evictable KV, and a successor re-locks KV that was evictable;
+        a forced continuation chunk does not check the pool, so a successor
+        must not be admitted into the room the tail needs."""
+        req = self.chunked_req
+        remaining_input = len(req.full_untruncated_fill_ids) - req.prefix_len
+        return (
+            adder.ceil_paged_tokens(remaining_input)
+            + adder.per_req_token_overhead
+            + adder._get_running_request_total_token_offset(req)
+        )
 
     def _jc_exclusive_admits(self, req: Req, admitted: List[Req]) -> bool:
         """Whether ``req``, prefix-matched for admission, still fits the
