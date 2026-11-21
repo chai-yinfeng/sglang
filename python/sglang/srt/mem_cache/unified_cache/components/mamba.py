@@ -645,6 +645,11 @@ class MambaComponent(TreeComponent):
                 insert_params.mamba_value = active_value
             return cache_len
         else:
+            if insert_params.jc_mamba_snapshot is not None:
+                # Joint checkpoint: the caller hands over a slot holding the
+                # state at the key's end; the track buffer is left as it is.
+                insert_params.mamba_value = insert_params.jc_mamba_snapshot
+                return token_ids_len
             if cache_len is None:
                 return 0
             # Donate the mamba index to the radix cache instead of copying.
@@ -723,6 +728,9 @@ class MambaComponent(TreeComponent):
                 insert_result is None or insert_result.mamba_exist
             ):
                 self._free_mamba_value(insert_params.mamba_value)
+            if insert_params.jc_mamba_snapshot is not None:
+                # The track buffer was not donated, so its states keep their names.
+                return
             req.kv.mamba_last_track_seqlen = None
             req.kv.mamba_prev_track_seqlen = None
 

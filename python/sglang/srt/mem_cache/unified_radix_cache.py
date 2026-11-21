@@ -1174,9 +1174,18 @@ class UnifiedRadixCache(BasePrefixCache):
             return
         self.checkpoint_into_tree(req, up_to=up_to, **kwargs)
 
-    def checkpoint_into_tree(self, req: Req, *, up_to: int, **kwargs) -> None:
+    def checkpoint_into_tree(
+        self,
+        req: Req,
+        *,
+        up_to: int,
+        mamba_snapshot: Optional[torch.Tensor] = None,
+        **kwargs,
+    ) -> None:
         """Insert ``[cache_protected_len, up_to)`` of the request's record and
-        move its tree lock onto the node the insert ended on."""
+        move its tree lock onto the node the insert ended on. A running
+        request's ``mamba_snapshot`` (joint checkpoint) is a slot holding its
+        state exactly at ``up_to``; the tree takes it over."""
         # A finished request hands its component state (mamba) to the tree
         # instead of forking it, and the tree frees what the request still held.
         is_finished = req.finished()
@@ -1199,6 +1208,7 @@ class UnifiedRadixCache(BasePrefixCache):
             priority=req.priority or 0,
             session_id=req.session_id,
             rotation_base=req.kv_rotation_base,
+            jc_mamba_snapshot=mamba_snapshot,
         )
         effective_cache_len = len(token_ids)
         for comp in self._components_tuple:
@@ -3997,6 +4007,53 @@ class UnifiedRadixCache(BasePrefixCache):
             return []
         (path,) = self.tree_core.collect_path_info([node])
         return [(info.node_id, info.path_start, info.path_end) for info in path]
+
+    def mamba_state_nodes(self, node: NodeId) -> List[Tuple[NodeId, int]]:
+        """(node, end) of the nodes on the root-to-``node`` path that hold a
+        device mamba state, in path order; end is the state's token offset."""
+        return [
+            (node_id, end)
+            for node_id, _, end in self.path_spans(node)
+            if self.tree_core.get_component_device_value(node_id, ComponentType.MAMBA)
+            is not None
+        ]
+
+    def attach_mamba_state(
+        self, req: Req, *, seqlen: int, mamba_value: torch.Tensor
+    ) -> NodeId:
+        """Joint checkpoint: make ``mamba_value`` (shape [1], the request's
+        state after ``seqlen`` tokens) the mamba value of the node ending at
+        ``seqlen`` on the request's tree path, splitting a node there. The
+        KV [0, seqlen) is the tree's already (seqlen <= cache_protected_len).
+        The tree takes the slot over, or frees it when the node has a state."""
+        assert 0 < seqlen <= req.kv.cache_protected_len, (
+            f"{seqlen=} {req.kv.cache_protected_len=}"
+        )
+        key = RadixKey(
+            req.full_untruncated_fill_ids[:seqlen],
+            req.extra_key,
+            is_bigram=self.tree_core.is_eagle,
+            cache_salt=req.cache_salt,
+        )
+        values = self.req_to_token_pool.req_to_token[req.kv.req_pool_idx, :seqlen].to(
+            dtype=torch.int64, copy=True
+        )
+        # prev_prefix_len = seqlen: these are the tree's own slots, not duplicates.
+        result = self.insert(
+            InsertParams(
+                key=key,
+                value=values,
+                mamba_value=mamba_value,
+                prev_prefix_len=seqlen,
+                inserted_len=seqlen,
+                priority=req.priority or 0,
+                session_id=req.session_id,
+                rotation_base=req.kv_rotation_base,
+            )
+        )
+        if result.mamba_exist:
+            self.req_to_token_pool.mamba_allocator.free(mamba_value)
+        return result.last_device_node
 
     def root_node_handle(self, extra_key: Optional[str] = None) -> NodeId:
         """The root's NodeId -- URC match results carry NodeIds."""
