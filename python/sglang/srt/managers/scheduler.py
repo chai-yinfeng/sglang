@@ -56,6 +56,7 @@ from sglang.srt.runtime_context import (
     get_schedule,
     get_serving,
     get_spec,
+    mamba_track_grid,
     publish,
     spawn_world_rank,
 )
@@ -324,6 +325,7 @@ from sglang.srt.mem_cache import kv_cache_builder
 from sglang.srt.mem_cache.allocator.page_interleave import page_interleave_shard_size
 from sglang.srt.mem_cache.base_prefix_cache import (
     CacheRequestOutcome,
+    EvictParams,
     MatchPrefixParams,
     TreeLock,
 )
@@ -333,6 +335,15 @@ from sglang.srt.mem_cache.common import (
     release_kv_cache,
 )
 from sglang.srt.mem_cache.events import KvEventLoraNames
+from sglang.srt.mem_cache.jc_mamba_history import (
+    JcMambaCapture,
+    JcMambaState,
+    classify_pin_target,
+    select_mamba_states,
+    setup_jc_hybrid,
+    swap_track_slot,
+    track_states,
+)
 from sglang.srt.mem_cache.radix_cache import RadixKey
 from sglang.srt.model_executor.forward_batch_info import PPProxyTensors
 from sglang.srt.model_executor.runner_utils.pool import prewarm_graph_pool_borrow
@@ -526,6 +537,11 @@ class Scheduler(
     # until the continuing request is admitted (a backstop; admission or an
     # abort of that request normally releases it within a step).
     JC_TRUNCATE_HOLD_TTL_S: float = 30.0
+    # Joint checkpoint on a hybrid (mamba) model, set by maybe_init_jc_hybrid:
+    # every hold then ends on a node holding the recurrent state at its end,
+    # and one such state weighs jc_mamba_snapshot_tokens in the pin cap.
+    jc_hybrid: bool = False
+    jc_mamba_snapshot_tokens: int = 0
 
     def __init__(
         self,
@@ -599,6 +615,10 @@ class Scheduler(
         self.jc_pause_timeout_s = get_memory().jc_pause_timeout_s
         self.jc_admit_first_max_tokens = get_memory().jc_admit_first_max_tokens
         self._jc_admit_first_streak = 0
+        self.jc_mamba_history_slots = get_memory().jc_mamba_history_slots
+        # Hybrid models: rid -> pin registered for a position decode has not
+        # reached yet (_jc_resolve_mamba_captures).
+        self.jc_mamba_captures: Dict[str, JcMambaCapture] = {}
         self.enable_hicache_storage = get_memory().hicache_storage_backend is not None
         self.enable_unified_cache_external_linker = (
             get_memory().enable_unified_cache_external_linker
@@ -785,6 +805,7 @@ class Scheduler(
         self.init_dsa_kpool_truncation_align()
         self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
+        self.maybe_init_jc_hybrid()
 
         self.init_weight_updater()
 
@@ -1884,6 +1905,29 @@ class Scheduler(
             self.truncation_align_size = math.lcm(
                 self.truncation_align_size, chunk_size
             )
+
+    def maybe_init_jc_hybrid(self):
+        """Joint checkpoint on a hybrid linear-attention model: validate its
+        mamba cache configuration, weigh a snapshot in KV tokens and give the
+        request pool its per-request snapshot rings."""
+        if not self.enable_joint_checkpoint or not self.tree_cache.supports_mamba():
+            return
+        mamba = get_exec().mamba
+        setup = setup_jc_hybrid(
+            pool=self.req_to_token_pool,
+            kv_cache=self.token_to_kv_pool_allocator.get_kvcache(),
+            max_total_num_tokens=self.max_total_num_tokens,
+            history_slots=self.jc_mamba_history_slots,
+            extra_buffer=mamba.enable_mamba_extra_buffer,
+            lazy=mamba.enable_mamba_extra_buffer_lazy,
+            int8_checkpoint=mamba.enable_int8_mamba_checkpoint,
+            replayssm=mamba.enable_linear_replayssm
+            or mamba.enable_linear_replayssm_spec,
+            spec_enabled=not self.spec_algorithm.is_none(),
+        )
+        self.req_to_token_pool.jc_mamba_history = setup.history
+        self.jc_mamba_snapshot_tokens = setup.snapshot_tokens
+        self.jc_hybrid = True
 
     def check_truncation_align_fits_chunk(self):
         """A chunk shorter than the alignment truncates to zero tokens, so a prompt
@@ -5667,6 +5711,8 @@ class Scheduler(
                 # Pinned nodes do not survive the reset; drop their locks with them.
                 self.pin_table.clear()
                 self.jc_degraded_pins.clear()
+                if self.jc_hybrid:
+                    self.jc_mamba_captures.clear()
             self.tree_cache.reset()
             self.req_to_token_pool.clear()
             self.token_to_kv_pool_allocator.clear()
@@ -6360,7 +6406,9 @@ class Scheduler(
           is still in the tree (_jc_truncate_degraded).
         Truncate only acts on KV known to exist: an in-flight request holds
         its own, a finished one's must be pinned. The position actually cut
-        at is req.jc_truncated_at (reported to the client).
+        at is req.jc_truncated_at (reported to the client). On a hybrid
+        (mamba) model the cut is where a saved recurrent state is, at or
+        before pos (req.jc_state_at, the same position); none at all refuses.
         """
         old_rid, pos = recv_req.truncate.rid, recv_req.truncate.pos
         if not self.enable_joint_checkpoint:
@@ -6388,6 +6436,8 @@ class Scheduler(
                 error_msg, cut = self._jc_truncate_degraded(old_rid, pos, req)
             else:
                 error_msg, cut = self._jc_truncate_pinned(old_rid, pos, req)
+        elif self.jc_hybrid:
+            error_msg, cut = self._jc_truncate_inflight_hybrid(old, req, pos)
         else:
             error_msg = self._jc_truncate_inflight(old, req, pos)
         if error_msg is not None:
@@ -6397,6 +6447,7 @@ class Scheduler(
         req.jc_admit_first = True
         req.jc_truncate_pos = cut
         req.jc_truncated_at = cut
+        req.jc_state_at = cut if self.jc_hybrid else None
         hold = self.pin_table.get(req.rid)
         req.jc_successor_held = (
             hold.pinned_len if hold is not None and hold.successor_of is not None else 0
@@ -6434,6 +6485,20 @@ class Scheduler(
             )
             if error_msg is not None:
                 return error_msg, 0
+        if self.jc_hybrid and cut < pin.pinned_len:
+            # The pin keeps the state at its end only; one before it needs a hold.
+            if pin.key is None:
+                return self._jc_no_state_message(old_rid, pos), 0
+            cut, node = self._jc_prefix_node(pin.key, self._jc_page_floor(cut))
+            if cut <= 0:
+                return self._jc_no_state_message(old_rid, pos), 0
+            self._jc_successor_hold(
+                cut_rid=old_rid,
+                successor_rid=req.rid,
+                node=node,
+                length=cut,
+                key=pin.key,
+            )
         logger.info(
             f"joint-checkpoint: truncate of finished rid={old_rid} at pos={pos} "
             f"via its pin (len={pin.pinned_len}): cut at {cut}; successor "
@@ -6478,6 +6543,8 @@ class Scheduler(
         if error_msg is not None:
             return error_msg, 0
         cut, node = self._jc_prefix_node(rec.key, want)
+        if self.jc_hybrid and cut <= 0:
+            return self._jc_no_state_message(old_rid, pos), 0
         del self.jc_degraded_pins[old_rid]
         held = 0
         if cut > 0:
@@ -6497,6 +6564,14 @@ class Scheduler(
 
     def _jc_truncate_inflight(self, old: Req, req: Req, pos: int) -> Optional[str]:
         """Truncate of a running or paused request: validate, then cut it."""
+        error_msg = self._jc_check_inflight(old, req, pos)
+        if error_msg is None:
+            self._jc_cut_inflight(old, req.rid, pos)
+        return error_msg
+
+    def _jc_check_inflight(self, old: Req, req: Req, pos: int) -> Optional[str]:
+        """Why the running or paused ``old`` cannot be cut at ``pos`` for
+        ``req``, or None."""
         if old is self.chunked_req or not old.kv.holds_kv:
             return f"request {old.rid} has not finished prefill"
         if old.to_finish is not None:
@@ -6528,7 +6603,6 @@ class Scheduler(
                     f"input_ids differ from request {old.rid} at position "
                     f"{first} (truncate pos={pos})"
                 )
-        self._jc_cut_inflight(old, req.rid, pos)
         return None
 
     def _jc_cut_inflight(self, old: Req, successor_rid: str, pos: int) -> None:
@@ -6553,8 +6627,6 @@ class Scheduler(
         process_batch_result (finished request: no output append, no second
         release) and the streamer does not stream it again.
         """
-        input_len = len(old.origin_input_ids)
-        total_len = input_len + len(old.output_ids)
         up_to = min(pos, old.owned_kv_len(), len(old.full_untruncated_fill_ids))
         if up_to > old.kv.cache_protected_len:
             self.tree_cache.checkpoint(old, up_to=up_to)
@@ -6562,7 +6634,16 @@ class Scheduler(
         # pin (or an earlier match) already published past the cut.
         kept = old.kv.cache_protected_len
         self._jc_hold_for_successor(old, successor_rid, kept)
+        self._jc_finish_cut(old, successor_rid, pos)
 
+    def _jc_finish_cut(self, old: Req, successor_rid: str, pos: int) -> None:
+        """Step 3 of _jc_cut_inflight (and of _jc_truncate_inflight_hybrid),
+        once the cut prefix is in the tree and held: finish ``old`` at
+        ``pos``, release all it holds past the tree-owned prefix, and stream
+        its final chunk."""
+        input_len = len(old.origin_input_ids)
+        total_len = input_len + len(old.output_ids)
+        kept = old.kv.cache_protected_len
         old.jc_truncate_to = pos
         old.finished_reason = FINISH_ABORT(
             f"Truncated to position {pos} by joint-checkpoint truncate."
@@ -6846,6 +6927,8 @@ class Scheduler(
             return PinReqOutput(
                 success=False, message="request is barred from the radix tree"
             )
+        if self.jc_hybrid:
+            return self._jc_pin_hybrid(req=req, up_to=recv_req.up_to, ttl_s=ttl_s)
         # Same clamp as release_kv_cache: only KV the request owns can be keyed.
         req.refresh_fill_ids()
         up_to = min(req.owned_kv_len(), len(req.full_untruncated_fill_ids))
@@ -7021,6 +7104,8 @@ class Scheduler(
             degraded=list(degraded),
             pins_degraded_total=self.jc_pins_degraded_total,
             pins_repinned_total=self.jc_pins_repinned_total,
+            jc_state_at=pinned_len if self.jc_hybrid else None,
+            mamba_history_slots=self._jc_mamba_history_slots(),
         )
 
     def _jc_ttl_refusal(self, ttl_s: float) -> Optional[str]:
@@ -7130,14 +7215,15 @@ class Scheduler(
         and those in ``degraded``. Nodes the other holds already keep cost
         nothing."""
         limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
-        held = self.tree_cache.union_path_spans(
-            [
-                pin.lock.node
-                for other, pin in self.pin_table.items()
-                if other != rid and other not in degraded
-            ]
-        )
-        room = limit - sum(held.values())
+        other_nodes = [
+            pin.lock.node
+            for other, pin in self.pin_table.items()
+            if other != rid and other not in degraded
+        ]
+        held = self.tree_cache.union_path_spans(other_nodes)
+        # Hybrid: one recurrent state per held node, and one for this hold.
+        snapshots = len(set(other_nodes)) + 1
+        room = limit - sum(held.values()) - self.jc_mamba_snapshot_tokens * snapshots
         fit = 0
         for node_id, start, end in self.tree_cache.path_spans(node):
             if node_id not in held:
@@ -7272,6 +7358,11 @@ class Scheduler(
         degraded: List[str] = []
         fit = None
         node = req.last_node
+        if self.jc_hybrid and pinned_len > 0:
+            # The hold ends where a recurrent state is (the match stops there).
+            pinned_len, node = self._jc_prefix_node(
+                self._jc_pin_key(req, pinned_len), pinned_len
+            )
         if pinned_len <= 0:
             refusal = "no KV of the request is in the radix tree"
         else:
@@ -7296,6 +7387,8 @@ class Scheduler(
             }
         else:
             req.jc_pin_outcome = {"jc_pinned_len": pinned_len}
+        if self.jc_hybrid and refusal is None:
+            req.jc_pin_outcome["jc_state_at"] = pinned_len
         if degraded:
             req.jc_pin_outcome["jc_pin_degraded"] = degraded
         if refusal is not None:
@@ -7310,11 +7403,323 @@ class Scheduler(
             f"degraded={degraded}"
         )
 
+    # ===== Joint checkpoint on hybrid (mamba) models =====
+
+    def _jc_pin_hybrid(
+        self, *, req: Req, up_to: Optional[int], ttl_s: float
+    ) -> PinReqOutput:
+        """Joint checkpoint P1 on a hybrid model. A recurrent state only
+        returns to positions where it was saved, so the hold ends on a node
+        holding the state at its end (pinned_len == jc_state_at). ``up_to``
+        (page-aligned down; None means the head) is compared with the head,
+        kv_committed_len, the position the request's latest launched forward
+        leaves its state at (under overlap that forward may be in flight):
+
+        - past it: registered and captured exactly when decode gets there
+          (_jc_resolve_mamba_captures); the response says it is not in effect;
+        - at it: exact from the working slot without overlap, or from the
+          in-flight step's track when it tracks; otherwise as below;
+        - before it: the nearest saved state at or before ``up_to``.
+        """
+        if req is self.chunked_req:
+            return PinReqOutput(
+                success=False, message=f"request {req.rid} has not finished prefill"
+            )
+        req.refresh_fill_ids()
+        head = req.kv.kv_committed_len
+        target = self._jc_page_floor(head if up_to is None else up_to)
+        kind = classify_pin_target(
+            target=target,
+            head=head,
+            overlap=self.enable_overlap,
+            head_tracked=head % mamba_track_grid(self.tree_cache.page_size) == 0
+            or head == req.jc_mamba_capture_at,
+        )
+        self._jc_cancel_mamba_capture(req.rid)
+        if kind == "capture":
+            return self._jc_register_mamba_capture(
+                req=req, target=target, head=head, ttl_s=ttl_s
+            )
+        return self._jc_pin_mamba_state(
+            req=req,
+            target=target,
+            ttl_s=ttl_s,
+            states=self._jc_mamba_states(req, with_copy=kind == "copy"),
+        )
+
+    def _jc_register_mamba_capture(
+        self, *, req: Req, target: int, head: int, ttl_s: float
+    ) -> PinReqOutput:
+        """Have decode track the state at ``target`` and pin it then. An
+        earlier pin on the rid stays until that happens."""
+        req.jc_mamba_capture_at = target
+        self.jc_mamba_captures[req.rid] = JcMambaCapture(target=target, ttl_s=ttl_s)
+        pin = self.pin_table.get(req.rid)
+        held = pin.pinned_len if pin is not None else 0
+        logger.info(
+            f"joint-checkpoint: registered mamba capture rid={req.rid} at "
+            f"{target} (head {head})"
+        )
+        return PinReqOutput(
+            success=True,
+            pinned_len=held,
+            message=(
+                f"registered: the state at position {target} is captured when "
+                f"decode reaches it (now at {head}); the pin takes effect then"
+            ),
+            pinned_tokens_total=self._jc_pinned_tokens_total(),
+            pinned_tokens_sum=self._jc_pinned_tokens_sum(),
+            pins_degraded_total=self.jc_pins_degraded_total,
+            pins_repinned_total=self.jc_pins_repinned_total,
+            jc_state_at=held if pin is not None else None,
+            jc_capture_at=target,
+            mamba_history_slots=self._jc_mamba_history_slots(),
+        )
+
+    def _jc_pin_mamba_state(
+        self,
+        *,
+        req: Req,
+        target: int,
+        ttl_s: float,
+        states: List[JcMambaState],
+    ) -> PinReqOutput:
+        """Hold the running ``req``'s KV and state at the nearest of
+        ``states`` at or before ``target``, under the pin cap and overflow
+        policy of /pin_request (a partial fit moves to an earlier state)."""
+        rid = req.rid
+        choices = select_mamba_states(states, target)
+        if not choices:
+            return PinReqOutput(
+                success=False, message=self._jc_no_state_message(rid, target)
+            )
+        anchor, extra_tokens = self._jc_mamba_hold_anchor(req, choices[0].seqlen)
+        refusal, degraded, fit = self._jc_make_room(
+            rid=rid, node=anchor, extra_tokens=extra_tokens
+        )
+        if refusal is None and fit is not None:
+            choices = select_mamba_states(choices, self._jc_page_floor(fit))
+            if not choices:
+                refusal = self._jc_no_state_message(rid, fit)
+        published = None
+        if refusal is None:
+            published = self._jc_publish_mamba_state(req, choices)
+            if published is None:
+                refusal = f"no free mamba slot to publish the state of request {rid}"
+        if published is not None and not self._jc_take_hold(
+            rid=rid,
+            node=published[1],
+            pinned_len=published[0],
+            ttl_s=ttl_s,
+            key=self._jc_pin_key(req, published[0]),
+        ):
+            refusal = "tree did not hand out a lock"
+        if refusal is not None:
+            return PinReqOutput(
+                success=False,
+                message=refusal,
+                degraded=degraded,
+                pinned_tokens_total=self._jc_pinned_tokens_total(),
+                pinned_tokens_sum=self._jc_pinned_tokens_sum(),
+                pins_degraded_total=self.jc_pins_degraded_total,
+                pins_repinned_total=self.jc_pins_repinned_total,
+                mamba_history_slots=self._jc_mamba_history_slots(),
+            )
+        pinned_len = published[0]
+        out = self._jc_pin_output(pinned_len=pinned_len, ttl_s=ttl_s, degraded=degraded)
+        if fit is not None:
+            out.message = self._jc_partial_message(pinned_len, target)
+        elif pinned_len < target:
+            out.message = (
+                f"recurrent state saved at {pinned_len}, not at {target}: a "
+                f"continuation recomputes [{pinned_len}, {target})"
+            )
+        logger.info(
+            f"joint-checkpoint: pinned rid={rid} len={pinned_len} (target "
+            f"{target}) expires_in_s={ttl_s} "
+            f"pinned_tokens_total={out.pinned_tokens_total} "
+            f"mamba_history_slots={out.mamba_history_slots} degraded={degraded}"
+        )
+        return out
+
+    def _jc_resolve_mamba_captures(self) -> None:
+        """Pins registered for a position decode had not reached: once the
+        step reaching it has been processed, pin the state there (its track;
+        the nearest saved state before it if the track was lost). A request
+        that finished first drops its registration."""
+        for rid, capture in list(self.jc_mamba_captures.items()):
+            req = self._find_inflight_req(rid)
+            if req is None or req.finished() or not req.kv.holds_kv:
+                del self.jc_mamba_captures[rid]
+                logger.info(
+                    f"joint-checkpoint: dropped mamba capture rid={rid} at "
+                    f"{capture.target}: the request finished first"
+                )
+                continue
+            if len(req.origin_input_ids) + len(req.output_ids) <= capture.target:
+                continue
+            del self.jc_mamba_captures[rid]
+            req.jc_mamba_capture_at = None
+            req.refresh_fill_ids()
+            out = self._jc_pin_mamba_state(
+                req=req,
+                target=capture.target,
+                ttl_s=capture.ttl_s,
+                states=self._jc_mamba_states(
+                    req, with_copy=self._jc_can_copy_head(req, capture.target)
+                ),
+            )
+            logger.info(
+                f"joint-checkpoint: mamba capture rid={rid} at {capture.target}: "
+                f"success={out.success} pinned_len={out.pinned_len} {out.message}"
+            )
+
+    def _jc_cancel_mamba_capture(self, rid: str) -> None:
+        if self.jc_mamba_captures.pop(rid, None) is None:
+            return
+        req = self._find_inflight_req(rid)
+        if req is not None:
+            req.jc_mamba_capture_at = None
+
+    def _jc_truncate_inflight_hybrid(
+        self, old: Req, req: Req, pos: int
+    ) -> Tuple[Optional[str], int]:
+        """Truncate of a running or paused request on a hybrid model: cut at
+        the nearest saved state at or before ``pos`` (published to the tree if
+        it is not there yet and held for ``req``); returns (error, cut). No
+        state at all refuses rather than recompute from the start."""
+        error_msg = self._jc_check_inflight(old, req, pos)
+        if error_msg is not None:
+            return error_msg, 0
+        target = self._jc_page_floor(
+            min(pos, old.owned_kv_len(), len(old.full_untruncated_fill_ids))
+        )
+        states = self._jc_mamba_states(
+            old, with_copy=self._jc_can_copy_head(old, target)
+        )
+        published = self._jc_publish_mamba_state(
+            old, select_mamba_states(states, target)
+        )
+        if published is None:
+            return self._jc_no_state_message(old.rid, pos), 0
+        cut, node = published
+        self._jc_successor_hold(
+            cut_rid=old.rid,
+            successor_rid=req.rid,
+            node=node,
+            length=cut,
+            key=self._jc_pin_key(old, cut),
+        )
+        self._jc_finish_cut(old, req.rid, pos)
+        return None, cut
+
+    def _jc_can_copy_head(self, req: Req, target: int) -> bool:
+        """Without overlap no forward is in flight between steps, so the
+        working slot holds the state at kv_committed_len exactly."""
+        return not self.enable_overlap and target == req.kv.kv_committed_len
+
+    def _jc_mamba_states(self, req: Req, *, with_copy: bool) -> List[JcMambaState]:
+        """The recurrent states ``req`` can return to: mamba values on its
+        tree path, its snapshot history, its decode track buffer and, with
+        ``with_copy``, its working slot at kv_committed_len."""
+        pool = self.req_to_token_pool
+        states = [
+            JcMambaState(seqlen=end, source="tree", node=node)
+            for node, end in self.tree_cache.mamba_state_nodes(req.last_node)
+        ]
+        states += [
+            JcMambaState(seqlen=snap.seqlen, source="ring")
+            for snap in pool.jc_mamba_history.snapshots(req.kv.req_pool_idx)
+        ]
+        states += track_states(
+            req, track_buffer_size=pool.mamba_ping_pong_track_buffer_size
+        )
+        if with_copy:
+            states.append(JcMambaState(seqlen=req.kv.kv_committed_len, source="copy"))
+        return states
+
+    def _jc_mamba_hold_anchor(self, req: Req, seqlen: int) -> Tuple[Any, int]:
+        """(node, extra tokens) to weigh a hold ending at ``seqlen`` on
+        ``req``'s path in the pin cap before it is published: the deepest
+        path node ending at or before it, and the tokens past that node."""
+        if seqlen >= req.kv.cache_protected_len:
+            return req.last_node, seqlen - req.kv.cache_protected_len
+        node, end = self.tree_cache.root_node_handle(req.extra_key), 0
+        for node_id, _, path_end in self.tree_cache.path_spans(req.last_node):
+            if path_end > seqlen:
+                break
+            node, end = node_id, path_end
+        return node, seqlen - end
+
+    def _jc_publish_mamba_state(
+        self, req: Req, choices: Sequence[JcMambaState]
+    ) -> Optional[Tuple[int, Any]]:
+        """Put the first of ``choices`` that can be published into the tree
+        as a node's mamba value (with the KV before it) and return (seqlen,
+        node); None when none can (no free mamba slot)."""
+        for state in choices:
+            if state.source == "tree":
+                return state.seqlen, state.node
+            slot = self._jc_take_mamba_slot(req, state)
+            if slot is None:
+                continue
+            if state.seqlen <= req.kv.cache_protected_len:
+                node = self.tree_cache.attach_mamba_state(
+                    req, seqlen=state.seqlen, mamba_value=slot
+                )
+                return state.seqlen, node
+            self.tree_cache.checkpoint(req, up_to=state.seqlen, mamba_snapshot=slot)
+            # A declined insert leaves the protected prefix where it was.
+            if req.kv.cache_protected_len == state.seqlen:
+                return state.seqlen, req.last_node
+        return None
+
+    def _jc_take_mamba_slot(self, req: Req, state: JcMambaState) -> Optional[Any]:
+        """A slot (shape [1]) holding ``state`` that the caller owns: the
+        history entry itself, a track buffer entry swapped for a fresh slot,
+        or a copy of the working slot."""
+        pool = self.req_to_token_pool
+        if state.source == "ring":
+            return pool.jc_mamba_history.take(req.kv.req_pool_idx, state.seqlen)
+        new_slot = pool.mamba_allocator.alloc(1)
+        if new_slot is None:
+            self.tree_cache.evict_for_alloc(EvictParams(num_tokens=0, mamba_num=1))
+            new_slot = pool.mamba_allocator.alloc(1)
+        if new_slot is None:
+            return None
+        if state.source == "copy":
+            translate = pool.translate_mamba_indices
+            pool.mamba_pool.copy_from(
+                translate(req.kv.mamba_pool_idx.unsqueeze(0)), translate(new_slot)
+            )
+            return new_slot
+        if state.track_idx == req.kv.mamba_last_track_idx:
+            req.kv.mamba_last_track_seqlen = None
+        else:
+            req.kv.mamba_prev_track_seqlen = None
+        return swap_track_slot(
+            pool=pool, req=req, idx=state.track_idx, new_slot=new_slot
+        )
+
+    def _jc_mamba_history_slots(self) -> int:
+        if not self.jc_hybrid:
+            return 0
+        return self.req_to_token_pool.jc_mamba_history.num_slots
+
+    @staticmethod
+    def _jc_no_state_message(rid: str, pos: int) -> str:
+        return (
+            f"no saved recurrent (mamba) state of request {rid} at or before "
+            f"position {pos}; refusing rather than recompute it from the start"
+        )
+
     def unpin_request(self, recv_req: UnpinReqInput):
         if not self.enable_joint_checkpoint:
             return UnpinReqOutput(
                 success=False, message="--enable-joint-checkpoint is not set"
             )
+        if self.jc_hybrid:
+            self._jc_cancel_mamba_capture(recv_req.rid)
         pin = self.pin_table.pop(recv_req.rid, None)
         if pin is None:
             # Never pinned, already unpinned, expired, degraded, or dropped by
@@ -7340,13 +7745,19 @@ class Scheduler(
     ) -> int:
         """Distinct tree tokens the holds keep (the union of their root-to-node
         paths, recomputed from the tree), without the holds of ``exclude`` and
-        with a path to ``extra_node`` added."""
+        with a path to ``extra_node`` added. On a hybrid model each distinct
+        held node, and the added hold, also weighs one recurrent state
+        (jc_mamba_snapshot_tokens)."""
         nodes = [
             pin.lock.node for rid, pin in self.pin_table.items() if rid not in exclude
         ]
+        snapshots = len(set(nodes)) + (extra_node is not None)
         if extra_node is not None:
             nodes.append(extra_node)
-        return self.tree_cache.union_path_tokens(nodes)
+        return (
+            self.tree_cache.union_path_tokens(nodes)
+            + self.jc_mamba_snapshot_tokens * snapshots
+        )
 
     def _jc_pinned_tokens_sum(self) -> int:
         """Sum of pinned_len over the holds (a shared prefix once per hold)."""
@@ -7380,6 +7791,8 @@ class Scheduler(
         resume, which is skipped under speculative decoding other than
         NGRAM."""
         self._jc_expire_pins()
+        if self.jc_hybrid and self.jc_mamba_captures:
+            self._jc_resolve_mamba_captures()
         return self._jc_pause_resume(running_batch)
 
     def _jc_pause_resume(self, running_batch: ScheduleBatch) -> ScheduleBatch:

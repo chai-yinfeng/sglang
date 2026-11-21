@@ -1822,7 +1822,8 @@ class BatchTokenIDOutput(BaseBatchReq, kw_only=True):
     # Joint checkpoint fields merged into a row's meta_info: the pin-on-finish
     # outcome on the final chunk ({"jc_pinned_len": int[, "jc_pin_message":
     # str][, "jc_pin_degraded": [rid]]}) and, on every chunk of a truncate
-    # successor, {"jc_truncated_at": int, "jc_successor_held": int}. None
+    # successor, {"jc_truncated_at": int, "jc_successor_held": int} (plus
+    # "jc_state_at": int on a hybrid model; on both, pin-on-finish too). None
     # entries elsewhere; the whole field is None when no row has one.
     jc_pin_outcomes: Optional[List[Optional[Dict[str, Any]]]] = None
 
@@ -2569,6 +2570,15 @@ class PinReqOutput(BaseReq, kw_only=True):
     pins_repinned_total: int = 0
     # True when this call re-pinned a pin the pressure valve had degraded.
     repinned: bool = False
+    # Hybrid (mamba) models: the position of the recurrent state the hold
+    # ends on (== pinned_len; a continuation recomputes from there), None on
+    # pure-attention models or when nothing is held.
+    jc_state_at: Optional[int] = None
+    # Hybrid models: a pin on a position decode has not reached is registered
+    # here and takes effect once decode passes it; not in effect yet.
+    jc_capture_at: Optional[int] = None
+    # Mamba pool slots held by all requests' snapshot histories.
+    mamba_history_slots: int = 0
 
 
 class UnpinReqInput(BaseReq, kw_only=True):

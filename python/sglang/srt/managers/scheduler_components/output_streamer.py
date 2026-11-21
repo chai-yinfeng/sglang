@@ -546,6 +546,8 @@ class _GenerationStreamAccumulator:
                 "jc_successor_held": req.jc_successor_held,
                 **(jc_meta or {}),
             }
+            if req.jc_state_at is not None:
+                jc_meta["jc_state_at"] = req.jc_state_at
         self.jc_pin_outcomes.append(jc_meta)
         if req.finished():
             self.weight_versions.append(
