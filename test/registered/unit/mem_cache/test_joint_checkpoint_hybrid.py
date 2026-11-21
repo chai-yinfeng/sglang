@@ -479,6 +479,21 @@ class TestJcHybridPin(_HybridFixture):
         self.assertTrue(out.success, out.message)
         self.assertEqual(out.pinned_tokens_total, 18 + 14)
 
+    def test_finish_after_a_pin_past_the_latest_track(self):
+        """The head copy publishes a state past the latest decode track (24);
+        finishing then has nothing longer to insert and keeps the published
+        prefix instead of asserting on a shorter one."""
+        s = self.make_scheduler([self.req], overlap=False)
+        head = self.req.kv.kv_committed_len
+        out = self.pin(s, head)
+        self.assertTrue(out.success, out.message)
+        self.assertEqual(out.jc_state_at, head)
+        self.assertEqual(self.req.kv.cache_protected_len, head)
+        self.finish(self.req)
+        self.assertEqual(self.match(head).device_prefix_len, head)
+        self.assertEqual(self.node_state_tag(s.pin_table["old"].lock.node), head)
+        self.assert_no_mamba_leak(s)
+
     def test_no_mamba_slot_leaks(self):
         self.assertTrue(self.pin(self.s, 13).success)
         self.assertTrue(self.pin(self.s, 22).success)

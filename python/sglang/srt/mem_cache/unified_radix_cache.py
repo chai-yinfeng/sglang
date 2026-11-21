@@ -1243,7 +1243,9 @@ class UnifiedRadixCache(BasePrefixCache):
             for comp in self._components_tuple:
                 comp.free_out_of_window_slots(req, len(radix_key) - 1, insert_params)
 
-        if effective_cache_len <= 0:
+        # A joint-checkpoint pin can publish a mamba state past the latest track,
+        # so the components may cap below the protected prefix: nothing new to insert.
+        if effective_cache_len <= 0 or effective_cache_len < req.kv.cache_protected_len:
             for comp in self._components_tuple:
                 comp.cleanup_after_caching_req(
                     req, is_finished=is_finished, insert_params=insert_params
