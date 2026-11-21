@@ -778,7 +778,17 @@ class UnifiedRadixCache(BasePrefixCache):
                         )
                         result.mamba_num_evicted += fallback_result.mamba_num_evicted
 
+        if mamba_target is not None:
+            self._reclaim_jc_mamba_history(mamba_target[1])
         return result
+
+    def _reclaim_jc_mamba_history(self, target: int) -> None:
+        """Joint checkpoint: free request snapshot-history slots, oldest first,
+        when evicting the tree left the mamba pool short of ``target``."""
+        history = self.req_to_token_pool.jc_mamba_history
+        if history is None:
+            return
+        history.reclaim(target - self._component_available_size(ComponentType.MAMBA))
 
     @staticmethod
     def _evict_request_by_type(params: EvictParams) -> dict[ComponentType, int]:

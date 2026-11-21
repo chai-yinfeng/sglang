@@ -559,5 +559,6 @@ POSITIONAL_FIELD_ORDER = (
     "jc_pin_max_ratio",
     "jc_pin_overflow",
     "jc_admit_first_max_tokens",
+    "jc_mamba_history_slots",
 )
 # fmt: on

@@ -103,6 +103,7 @@ if TYPE_CHECKING:
     from sglang.srt.managers.cache_controller import LayerDoneCounter
     from sglang.srt.managers.schedule_batch import Req
     from sglang.srt.mem_cache.device_pool_info import DevicePoolInfo, MHABufferInfo
+    from sglang.srt.mem_cache.jc_mamba_history import JcMambaHistory
 
 
 logger = logging.getLogger(__name__)
@@ -1356,6 +1357,9 @@ class HybridReqToTokenPool(ReqToTokenPool):
     """A memory pool that maps a request to its token locations."""
 
     mamba_pool_cls = MambaPool
+    # Joint checkpoint snapshot rings, set by the scheduler under
+    # --enable-joint-checkpoint; None leaves decode tracking as it is.
+    jc_mamba_history: Optional[JcMambaHistory] = None
 
     def __init__(
         self,
@@ -1830,6 +1834,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         assert mamba_index is not None, "double free? mamba_index is None"
         self.mamba_allocator.free(mamba_index.unsqueeze(0))
         req.kv.mamba_pool_idx = None
+        if self.jc_mamba_history is not None:
+            self.jc_mamba_history.release_row(req.kv.req_pool_idx)
 
         if self.enable_mamba_extra_buffer:
             size = self.mamba_ping_pong_track_buffer_size
@@ -1864,6 +1870,8 @@ class HybridReqToTokenPool(ReqToTokenPool):
         logger.info("Reset HybridReqToTokenPool")
         super().clear()
         self.mamba_allocator.clear()
+        if self.jc_mamba_history is not None:
+            self.jc_mamba_history.forget_all()
         self.short_conv_pool.clear()
         self.ngram_pool.clear()
         # The int8 checkpoint pool holds radix-cached states in its own slots; a

@@ -1543,7 +1543,11 @@ class SchedulerBatchResultProcessor:
         if known_boundary:
             self._mamba_assert_committed_len_lookahead(req)
             track_seqlen = req.kv.kv_committed_len
-            assert track_seqlen % mamba_track_grid(self.tree_cache.page_size) == 0
+            # Joint checkpoint tracks capture points off the grid too.
+            assert (
+                track_seqlen % mamba_track_grid(self.tree_cache.page_size) == 0
+                or batch.req_to_token_pool.jc_mamba_history is not None
+            )
             at_boundary = True
         else:
             at_boundary, track_seqlen = self._mamba_check_track_boundary(

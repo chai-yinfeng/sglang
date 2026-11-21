@@ -129,6 +129,10 @@ class Memory(msgspec.Struct):
         int,
         "Joint checkpoint: the successors of truncated requests get a prefill step of their own (no other waiting request and no chunked-prefill chunk in it) while their appended tokens total at most this many; a larger successor only goes to the head of the waiting queue. <= 0 disables the exclusive step. Only used with --enable-joint-checkpoint.",
     ] = 512
+    jc_mamba_history_slots: A[
+        int,
+        "Joint checkpoint on a hybrid linear-attention model: each running request keeps up to this many of its past recurrent states (one per --mamba-track-interval decode tokens, taken from the mamba pool) so a pin or truncate at an earlier position lands at most one interval before it; 0 keeps none. A slot that cannot be allocated is skipped, and the history gives slots back when the mamba pool runs short. Only used with --enable-joint-checkpoint.",
+    ] = 0
 
     # -------------------------------------------------------------------------
     # Hierarchical cache

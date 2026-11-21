@@ -117,6 +117,10 @@ def check_joint_checkpoint_server_args(server_args: Any) -> None:
             f"--jc-pin-ttl-s must be in (0, --jc-pin-max-ttl-s "
             f"{cfg.jc_pin_max_ttl_s}], got {cfg.jc_pin_ttl_s}"
         )
+    if cfg.jc_mamba_history_slots < 0:
+        raise ValueError(
+            f"--jc-mamba-history-slots must be >= 0, got {cfg.jc_mamba_history_slots}"
+        )
 
 
 def validate_response_store(server_args: Any) -> None:

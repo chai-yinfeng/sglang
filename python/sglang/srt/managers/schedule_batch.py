@@ -119,6 +119,7 @@ from sglang.srt.mem_cache.common import (
     match_kv_cache,
     release_kv_cache,
 )
+from sglang.srt.mem_cache.jc_mamba_history import decode_track_masks
 from sglang.srt.mem_cache.memory_pool import HybridReqToTokenPool, ReqToTokenPool
 from sglang.srt.mem_cache.unified_cache.component_type import ComponentType
 from sglang.srt.model_executor.encoder_swa_replay import resets_swa_window
@@ -1221,6 +1222,11 @@ class Req(ReqDllmMixin):
         self.jc_finish_hold: Optional[Callable[[Req], None]] = None
         self.jc_pin_ttl_s: Optional[float] = None
         self.jc_pin_outcome: Optional[Dict[str, Any]] = None
+        # Joint checkpoint on hybrid (mamba) models: the position a pending pin
+        # captures the recurrent state at when decode reaches it, and, on a
+        # truncate successor, the position of the state it continues from.
+        self.jc_mamba_capture_at: Optional[int] = None
+        self.jc_state_at: Optional[int] = None
 
         # For incremental decoding
         # ----- | --------- read_ids -------|
@@ -3661,6 +3667,26 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             self.model_config.vocab_size,
         )
 
+    def _jc_prepare_decode_track(
+        self, mamba_track_interval: int
+    ) -> Optional[Tuple[List[bool], List[bool]]]:
+        """Joint checkpoint on a hybrid model: this decode step's track masks
+        with the rows' pending capture points added, after retiring the track
+        entries the step overwrites (jc_mamba_history.retire_track_slots).
+        None without joint checkpoint."""
+        history = self.req_to_token_pool.jc_mamba_history
+        if history is None:
+            return None
+        masks = decode_track_masks(
+            seq_lens=self.seq_lens_cpu.tolist(),
+            capture_at=[req.jc_mamba_capture_at for req in self.reqs],
+            track_interval=mamba_track_interval,
+        )
+        history.retire_track_slots(
+            reqs=self.reqs, track_mask=masks[0], pool=self.req_to_token_pool
+        )
+        return masks
+
     def mamba_lazy_prealloc_at_boundary(self, mamba_track_interval: int):
         """Allocate a temporary second ping-pong slot for reqs at a track boundary.
 
@@ -3848,6 +3874,7 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
         if get_exec().mamba.enable_mamba_extra_buffer:
             mamba_track_interval = mamba_track_grid(self.tree_cache.page_size)
 
+            jc_masks = None
             if len(self.reqs) == 0:
                 self.mamba_track_indices = torch.empty(
                     (0,), dtype=torch.int64, device=self.device
@@ -3856,15 +3883,18 @@ class ScheduleBatch(ScheduleBatchDisaggregationDecodeMixin):
             else:
                 if get_exec().mamba.enable_mamba_extra_buffer_lazy:
                     self.mamba_lazy_prealloc_at_boundary(mamba_track_interval)
+                jc_masks = self._jc_prepare_decode_track(mamba_track_interval)
                 set_mamba_track_indices_from_reqs(self)
 
             track_remainders_cpu = self.seq_lens_cpu % mamba_track_interval
             track_mask_cpu = track_remainders_cpu == 0
+            track_mask_next_cpu = track_remainders_cpu == mamba_track_interval - 1
+            if jc_masks is not None:
+                track_mask_cpu = torch.tensor(jc_masks[0], dtype=torch.bool)
+                track_mask_next_cpu = torch.tensor(jc_masks[1], dtype=torch.bool)
             self.mamba_track_mask_cpu = track_mask_cpu.tolist()
             self.mamba_track_mask_next_cpu = (
-                (track_remainders_cpu == mamba_track_interval - 1).tolist()
-                if self.enable_overlap
-                else None
+                track_mask_next_cpu.tolist() if self.enable_overlap else None
             )
             # ScheduleBatch.copy() snapshots the list of requests, but the Req
             # objects remain shared. The next overlapped decode can therefore
