@@ -612,9 +612,15 @@ Please consult the documentation below and [server_args.py](https://github.com/s
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--jc-pin-overflow`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Joint checkpoint: what a new pin does when `--jc-pin-max-ratio` would be exceeded. `lru` degrades other pins, least recently pinned or renewed first, until it fits (a degraded pin loses its lock; its KV stays in the tree, evictable), and refuses only if it cannot fit even then; `refuse` refuses the new pin. Only used with `--enable-joint-checkpoint`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Joint checkpoint: what a new pin does when `--jc-pin-max-ratio` would be exceeded. `lru` degrades other pins, least recently pinned or renewed first, until it fits (a degraded pin loses its lock; its KV stays in the tree, evictable), and refuses only if it cannot fit even then; `next-use` degrades the pins expected to be used latest first (a pin's `/pin_request` `resume_in_s` hint, else its expiry), and only pins expected later than the new hold, which otherwise gets a partial hold or is refused; `refuse` refuses the new pin. Only used with `--enable-joint-checkpoint`.</td>
       <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`lru`</td>
-      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lru</code>, <code>refuse</code></td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>lru</code>, <code>next-use</code>, <code>refuse</code></td>
+    </tr>
+        <tr>
+      <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--jc-pin-budget`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}>Joint checkpoint: what `--jc-pin-max-ratio` counts. `distinct`: the distinct tree tokens the holds keep; `exclusive`: only those of them no in-flight request (running, chunked or paused) holds itself, i.e. the tokens kept resident by pins alone. Under `exclusive` the cap is also re-checked whenever the set of in-flight requests changes, degrading pins until it fits. Only used with `--enable-joint-checkpoint`.</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.02)"}}>`distinct`</td>
+      <td style={{padding: "9px 12px", backgroundColor: "rgba(255,255,255,0.05)"}}><code>distinct</code>, <code>exclusive</code></td>
     </tr>
         <tr>
       <td style={{padding: "9px 12px", fontWeight: 500, backgroundColor: "rgba(255,255,255,0.02)"}}>`--jc-admit-first-max-tokens`</td>

@@ -2545,10 +2545,14 @@ class PinReqInput(BaseReq, kw_only=True):
     longer running renews the TTL of its existing hold, whose coverage cannot
     grow (``up_to`` past it is refused). If that hold was degraded under pin
     pressure, the part of its path still in the tree is pinned again, like a
-    new pin; ``pinned_len`` in the reply says how much survived."""
+    new pin; ``pinned_len`` in the reply says how much survived.
+    ``resume_in_s`` (optional): the client expects to use the held KV again
+    in about this many seconds; --jc-pin-overflow next-use degrades the pins
+    expected to be used latest first (without a hint: the hold's expiry)."""
 
     up_to: Optional[int] = None
     ttl_s: Optional[float] = None
+    resume_in_s: Optional[float] = None
 
 
 class PinReqOutput(BaseReq, kw_only=True):
@@ -2582,12 +2586,21 @@ class PinReqOutput(BaseReq, kw_only=True):
 
 
 class UnpinReqInput(BaseReq, kw_only=True):
-    pass
+    """Joint checkpoint: release the hold of ``rid``. With ``release`` the
+    client also declares the rid's KV dead: after the hold goes, the tail of
+    its recorded path that nothing else holds (no lock: no running request,
+    pin or truncate hold) and nothing else continues (no other branch below
+    it) is freed from the radix tree right away instead of waiting for
+    eviction. Only FULL-attention trees without a host tier."""
+
+    release: bool = False
 
 
 class UnpinReqOutput(BaseReq, kw_only=True):
     success: bool
     message: str = ""
+    # Tokens freed from the radix tree by ``release``.
+    released_tokens: int = 0
 
 
 class PauseReqInput(BaseReq, kw_only=True):

@@ -373,6 +373,7 @@ from sglang.srt.rust_server.server import RustServer
 from sglang.srt.sampling.sampling_batch_info import SamplingBatchInfo
 from sglang.srt.server_args import PortArgs, ServerArgs
 from sglang.srt.session.session_controller import SessionController
+from sglang.srt.session.streaming_session import is_virtual_node
 from sglang.srt.speculative.base_spec_worker import BaseSpecWorker
 from sglang.srt.speculative.dflash_utils import validate_dflash_request
 from sglang.srt.speculative.eagle_utils import (
@@ -484,6 +485,13 @@ class JcPin:
     key: Optional[RadixKey] = None
     # time.monotonic() when the pressure valve dropped its lock.
     degraded_at: Optional[float] = None
+    # time.monotonic() when the client expects to use the held KV again
+    # (/pin_request resume_in_s); None: expires_at stands in for it
+    # (--jc-pin-overflow next-use).
+    expected_use_at: Optional[float] = None
+
+    def next_use(self) -> float:
+        return self.expires_at if self.expected_use_at is None else self.expected_use_at
 
 
 def _accumulate_decode_moment(
@@ -542,6 +550,11 @@ class Scheduler(
     # and one such state weighs jc_mamba_snapshot_tokens in the pin cap.
     jc_hybrid: bool = False
     jc_mamba_snapshot_tokens: int = 0
+    # Joint checkpoint pin budget (--jc-pin-budget); class-level defaults keep
+    # Schedulers built without __init__ on the distinct-token cap.
+    jc_pin_budget: str = "distinct"
+    _jc_inflight_seen: AbstractSet[str] = frozenset()
+    jc_released_tokens_total: int = 0
 
     def __init__(
         self,
@@ -603,6 +616,12 @@ class Scheduler(
         self.jc_pin_max_ttl_s = get_memory().jc_pin_max_ttl_s
         self.jc_pin_max_ratio = get_memory().jc_pin_max_ratio
         self.jc_pin_overflow = get_memory().jc_pin_overflow
+        self.jc_pin_budget = get_memory().jc_pin_budget
+        # --jc-pin-budget exclusive: the in-flight requests the cap was last
+        # checked against (_jc_enforce_pin_cap).
+        self._jc_inflight_seen = frozenset()
+        # /unpin_request release: tokens freed from the tree since start.
+        self.jc_released_tokens_total = 0
         # Pin pressure valve: rid -> pin whose lock was dropped to make room for
         # a newer pin; a renewal re-pins what of its path is still in the tree.
         self.jc_degraded_pins: Dict[str, JcPin] = {}
@@ -6915,9 +6934,16 @@ class Scheduler(
         ttl_s = recv_req.ttl_s if recv_req.ttl_s is not None else self.jc_pin_ttl_s
         if (refusal := self._jc_ttl_refusal(ttl_s)) is not None:
             return PinReqOutput(success=False, message=refusal)
+        resume_in_s = getattr(recv_req, "resume_in_s", None)
+        if resume_in_s is not None and not resume_in_s >= 0:
+            return PinReqOutput(
+                success=False, message=f"resume_in_s must be >= 0, got {resume_in_s}"
+            )
         req = self._find_inflight_req(rid)
         if req is None or req.finished() or not req.kv.holds_kv:
-            return self._jc_renew_pin(rid=rid, up_to=recv_req.up_to, ttl_s=ttl_s)
+            return self._jc_renew_pin(
+                rid=rid, up_to=recv_req.up_to, ttl_s=ttl_s, resume_in_s=resume_in_s
+            )
         if req.session is not None and req.session.streaming:
             # A streaming-session turn's tree lock belongs to the session slot.
             return PinReqOutput(
@@ -6941,6 +6967,7 @@ class Scheduler(
             rid=rid,
             node=req.last_node,
             extra_tokens=max(up_to - req.kv.cache_protected_len, 0),
+            next_use=self._jc_next_use(ttl_s, resume_in_s),
         )
         if refusal is not None:
             return PinReqOutput(
@@ -6970,6 +6997,7 @@ class Scheduler(
             pinned_len=pinned_len,
             ttl_s=ttl_s,
             key=self._jc_pin_key(req, pinned_len),
+            resume_in_s=resume_in_s,
         ):
             return PinReqOutput(
                 success=False,
@@ -6991,7 +7019,12 @@ class Scheduler(
         return out
 
     def _jc_renew_pin(
-        self, *, rid: str, up_to: Optional[int], ttl_s: float
+        self,
+        *,
+        rid: str,
+        up_to: Optional[int],
+        ttl_s: float,
+        resume_in_s: Optional[float] = None,
     ) -> PinReqOutput:
         """/pin_request on a rid that is not running: restart the TTL of its
         unexpired client pin or pin-on-finish hold (not a truncate hold), or
@@ -7000,7 +7033,9 @@ class Scheduler(
         past the hold is gone."""
         pin = self.pin_table.get(rid)
         if pin is None and rid in self.jc_degraded_pins:
-            return self._jc_repin_degraded(rid=rid, up_to=up_to, ttl_s=ttl_s)
+            return self._jc_repin_degraded(
+                rid=rid, up_to=up_to, ttl_s=ttl_s, resume_in_s=resume_in_s
+            )
         if (
             pin is None
             or pin.successor_of is not None
@@ -7019,14 +7054,20 @@ class Scheduler(
         now = time.monotonic()
         pin.pinned_at = now
         pin.expires_at = now + ttl_s
+        pin.expected_use_at = None if resume_in_s is None else now + resume_in_s
         logger.info(
             f"joint-checkpoint: renewed pin rid={rid} len={pin.pinned_len} "
-            f"expires_in_s={ttl_s}"
+            f"expires_in_s={ttl_s} resume_in_s={resume_in_s}"
         )
         return self._jc_pin_output(pinned_len=pin.pinned_len, ttl_s=ttl_s)
 
     def _jc_repin_degraded(
-        self, *, rid: str, up_to: Optional[int], ttl_s: float
+        self,
+        *,
+        rid: str,
+        up_to: Optional[int],
+        ttl_s: float,
+        resume_in_s: Optional[float] = None,
     ) -> PinReqOutput:
         """Renewal of a degraded pin: hold again the longest prefix of its old
         path still in the tree (eviction may have taken its tail), admitted
@@ -7054,7 +7095,9 @@ class Scheduler(
                 pins_degraded_total=self.jc_pins_degraded_total,
                 pins_repinned_total=self.jc_pins_repinned_total,
             )
-        refusal, degraded, fit = self._jc_make_room(rid=rid, node=node)
+        refusal, degraded, fit = self._jc_make_room(
+            rid=rid, node=node, next_use=self._jc_next_use(ttl_s, resume_in_s)
+        )
         pinned_len = survived
         if refusal is None and fit is not None and fit < survived:
             pinned_len, node = self._jc_prefix_node(old.key, fit)
@@ -7068,6 +7111,7 @@ class Scheduler(
                 old.key.extra_key,
                 cache_salt=old.key.cache_salt,
             ),
+            resume_in_s=resume_in_s,
         ):
             refusal = "tree did not hand out a lock"
         if refusal is not None:
@@ -7117,21 +7161,31 @@ class Scheduler(
         return None
 
     def _jc_pin_cap_refusal(
-        self, *, rid: str, node: Any, extra_tokens: int = 0
+        self,
+        *,
+        rid: str,
+        node: Any,
+        extra_tokens: int = 0,
+        free: Optional[AbstractSet[Any]] = None,
     ) -> Optional[str]:
         """The --jc-pin-max-ratio refusal for a hold of ``rid`` on the path to
         ``node`` (plus ``extra_tokens`` past it), or None. Judged on the
         distinct tree tokens all pins would hold, after replacing the rid's
-        own earlier hold: a prefix shared by several holds counts once."""
+        own earlier hold: a prefix shared by several holds counts once.
+        Under --jc-pin-budget exclusive the nodes in ``free`` (default: those
+        in-flight requests hold, _jc_free_nodes) do not count."""
         if self.jc_pin_max_ratio <= 0:
             return None
+        if free is None:
+            free = self._jc_free_nodes()
         projected = (
-            self._jc_pinned_tokens_total(exclude={rid}, extra_node=node) + extra_tokens
+            self._jc_pinned_tokens_total(exclude={rid}, extra_node=node, free=free)
+            + extra_tokens
         )
         limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
         if projected <= limit:
             return None
-        others = self._jc_pinned_tokens_total(exclude={rid})
+        others = self._jc_pinned_tokens_total(exclude={rid}, free=free)
         return (
             f"pin cap exceeded: {projected} distinct pinned tokens with this hold "
             f"on {rid} ({others} without it) > limit {limit} "
@@ -7140,7 +7194,12 @@ class Scheduler(
         )
 
     def _jc_make_room(
-        self, *, rid: str, node: Any, extra_tokens: int = 0
+        self,
+        *,
+        rid: str,
+        node: Any,
+        extra_tokens: int = 0,
+        next_use: Optional[float] = None,
     ) -> Tuple[Optional[str], List[str], Optional[int]]:
         """Fit a hold of ``rid`` on the path to ``node`` (plus ``extra_tokens``)
         under --jc-pin-max-ratio. Returns (refusal, degraded rids, fit). Over
@@ -7150,25 +7209,37 @@ class Scheduler(
         degraded, ``fit`` is the longest page-aligned prefix of the hold that
         does (the caller holds only that), with only the pins that prefix
         needs degraded; a zero-length fit refuses with nothing degraded.
-        Truncate holds are never degraded. ``fit`` is None for a whole hold."""
+        Truncate holds are never degraded. ``fit`` is None for a whole hold.
+
+        --jc-pin-overflow next-use: the candidates are the pins expected to be
+        used later than the new hold (``next_use``, time.monotonic(); None:
+        later than every pin), latest first (JcPin.next_use); a new hold
+        expected to be used after all of them degrades nothing and gets the
+        partial hold or refusal that leaves."""
+        free = self._jc_free_nodes()
         refusal = self._jc_pin_cap_refusal(
-            rid=rid, node=node, extra_tokens=extra_tokens
+            rid=rid, node=node, extra_tokens=extra_tokens, free=free
         )
-        if refusal is None or self.jc_pin_overflow != "lru":
+        if refusal is None or self.jc_pin_overflow not in ("lru", "next-use"):
             return refusal, [], None
         limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
-        candidates = sorted(
-            (
+        candidates = self._jc_valve_order(
+            [
                 other
                 for other, pin in self.pin_table.items()
-                if other != rid and pin.successor_of is None
-            ),
-            key=lambda other: self.pin_table[other].pinned_at,
+                if other != rid
+                and pin.successor_of is None
+                and (
+                    self.jc_pin_overflow != "next-use"
+                    or next_use is None
+                    or pin.next_use() > next_use
+                )
+            ]
         )
 
         def fits(degraded: AbstractSet[str]) -> bool:
             held = self._jc_pinned_tokens_total(
-                exclude=degraded | {rid}, extra_node=node
+                exclude=degraded | {rid}, extra_node=node, free=free
             )
             return held + extra_tokens <= limit
 
@@ -7181,18 +7252,28 @@ class Scheduler(
                     node=node,
                     extra_tokens=extra_tokens,
                     degraded=frozenset(candidates),
+                    free=free,
                 )
             )
             if fit <= 0:
+                which = (
+                    "every pin expected to be used later"
+                    if self.jc_pin_overflow == "next-use"
+                    else "every other pin"
+                )
                 return (
-                    f"{refusal}; degrading every other pin would not make room",
+                    f"{refusal}; degrading {which} would not make room",
                     [],
                     None,
                 )
 
             def prefix_fits(degraded: AbstractSet[str]) -> bool:
                 longest = self._jc_longest_fit(
-                    rid=rid, node=node, extra_tokens=extra_tokens, degraded=degraded
+                    rid=rid,
+                    node=node,
+                    extra_tokens=extra_tokens,
+                    degraded=degraded,
+                    free=free,
                 )
                 return self._jc_page_floor(longest) >= fit
 
@@ -7208,30 +7289,43 @@ class Scheduler(
         node: Any,
         extra_tokens: int = 0,
         degraded: AbstractSet[str] = frozenset(),
+        free: Optional[AbstractSet[Any]] = None,
     ) -> int:
         """Longest prefix of a hold's path (root to ``node``, then
         ``extra_tokens`` tokens not in the tree yet) whose distinct tokens fit
         under --jc-pin-max-ratio beside the other holds, without ``rid``'s own
         and those in ``degraded``. Nodes the other holds already keep cost
-        nothing."""
+        nothing, nor (--jc-pin-budget exclusive) nodes in ``free``."""
         limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
+        if free is None:
+            free = self._jc_free_nodes()
         other_nodes = [
             pin.lock.node
             for other, pin in self.pin_table.items()
             if other != rid and other not in degraded
         ]
-        held = self.tree_cache.union_path_spans(other_nodes)
+        held = {
+            node_id: span
+            for node_id, span in self.tree_cache.union_path_spans(other_nodes).items()
+            if node_id not in free
+        }
         # Hybrid: one recurrent state per held node, and one for this hold.
         snapshots = len(set(other_nodes)) + 1
         room = limit - sum(held.values()) - self.jc_mamba_snapshot_tokens * snapshots
         fit = 0
         for node_id, start, end in self.tree_cache.path_spans(node):
-            if node_id not in held:
+            if node_id not in held and node_id not in free:
                 if end - start > room:
                     return start + max(room, 0)
                 room -= end - start
             fit = end
         return fit + min(extra_tokens, max(room, 0))
+
+    @staticmethod
+    def _jc_next_use(ttl_s: float, resume_in_s: Optional[float]) -> float:
+        """When a hold about to be taken is expected to be used again: in
+        resume_in_s seconds, else at its expiry (time.monotonic())."""
+        return time.monotonic() + (ttl_s if resume_in_s is None else resume_in_s)
 
     def _jc_page_floor(self, n: int) -> int:
         return n // self.page_size * self.page_size
@@ -7279,9 +7373,11 @@ class Scheduler(
         pinned_len: int,
         ttl_s: float,
         key: Optional[RadixKey],
+        resume_in_s: Optional[float] = None,
     ) -> bool:
         """Lock ``node`` (ending [0, pinned_len) in the tree, whose path is
-        ``key``) as the pin of ``rid`` for ``ttl_s`` seconds. An earlier hold
+        ``key``) as the pin of ``rid`` for ``ttl_s`` seconds, expected to be
+        used again in ``resume_in_s`` seconds (None: unknown). An earlier hold
         of the rid is replaced and unlocked, restarting the TTL. False, with
         nothing changed, when the tree hands out no lock."""
         new_lock = self.tree_cache.lock(node)
@@ -7296,6 +7392,7 @@ class Scheduler(
             pinned_at=now,
             expires_at=now + ttl_s,
             key=key,
+            expected_use_at=None if resume_in_s is None else now + resume_in_s,
         )
         if old_pin is not None:
             self.tree_cache.unlock(old_pin.lock)
@@ -7366,7 +7463,9 @@ class Scheduler(
         if pinned_len <= 0:
             refusal = "no KV of the request is in the radix tree"
         else:
-            refusal, degraded, fit = self._jc_make_room(rid=req.rid, node=node)
+            refusal, degraded, fit = self._jc_make_room(
+                rid=req.rid, node=node, next_use=self._jc_next_use(ttl_s, None)
+            )
         want = pinned_len
         if refusal is None and fit is not None and fit < pinned_len:
             pinned_len, node = self._jc_prefix_node(self._jc_pin_key(req, fit), fit)
@@ -7720,43 +7819,168 @@ class Scheduler(
             )
         if self.jc_hybrid:
             self._jc_cancel_mamba_capture(recv_req.rid)
+        # A client without the field (or an older caller) never releases.
+        release = bool(getattr(recv_req, "release", False))
         pin = self.pin_table.pop(recv_req.rid, None)
         if pin is None:
             # Never pinned, already unpinned, expired, degraded, or dropped by
             # flush_cache: the hold is gone either way, which is what unpin
             # asks for.
-            if self.jc_degraded_pins.pop(recv_req.rid, None) is not None:
-                return UnpinReqOutput(
+            degraded = self.jc_degraded_pins.pop(recv_req.rid, None)
+            if degraded is not None:
+                out = UnpinReqOutput(
                     success=True,
                     message=(
                         f"request {recv_req.rid} was not pinned "
                         f"(degraded under pin pressure)"
                     ),
                 )
+                if release:
+                    self._jc_release_path(recv_req.rid, degraded, out)
+                return out
             return UnpinReqOutput(
                 success=True, message=f"request {recv_req.rid} was not pinned"
             )
         self.tree_cache.unlock(pin.lock)
         logger.info(f"joint-checkpoint: unpinned rid={recv_req.rid}")
-        return UnpinReqOutput(success=True)
+        out = UnpinReqOutput(success=True)
+        if release and pin.successor_of is None:
+            self._jc_release_path(recv_req.rid, pin, out)
+        return out
+
+    def _jc_release_path(self, rid: str, pin: JcPin, out: UnpinReqOutput) -> None:
+        """/unpin_request release: the client declares ``rid``'s KV dead, so
+        once its hold is gone the tail of its recorded path nothing else holds
+        or continues is freed from the tree now
+        (UnifiedRadixCache.jc_release_exclusive_tail). A degraded hold's path
+        is matched again first (eviction may have taken its tail), and a live
+        one's too: a node split since the hold was taken leaves the hold's id on
+        part of the path only."""
+        if pin.key is None:
+            out.message = f"request {rid} has no recorded path; nothing released"
+            return
+        match = self.tree_cache.match_prefix(MatchPrefixParams(key=pin.key))
+        if match.device_prefix_len <= 0:
+            return
+        node = match.last_device_node
+        release = getattr(self.tree_cache, "jc_release_exclusive_tail", None)
+        if release is None:
+            out.message = "release needs the unified radix cache; nothing released"
+            return
+        freed, why = release(node)
+        out.released_tokens = freed
+        if why is not None:
+            out.message = f"nothing released: {why}"
+        self.jc_released_tokens_total += freed
+        logger.info(
+            f"joint-checkpoint: released rid={rid} freed={freed} "
+            f"(path len {pin.pinned_len}) released_tokens_total="
+            f"{self.jc_released_tokens_total}"
+        )
 
     def _jc_pinned_tokens_total(
-        self, *, exclude: AbstractSet[str] = frozenset(), extra_node: Any = None
+        self,
+        *,
+        exclude: AbstractSet[str] = frozenset(),
+        extra_node: Any = None,
+        free: Optional[AbstractSet[Any]] = None,
     ) -> int:
         """Distinct tree tokens the holds keep (the union of their root-to-node
         paths, recomputed from the tree), without the holds of ``exclude`` and
         with a path to ``extra_node`` added. On a hybrid model each distinct
         held node, and the added hold, also weighs one recurrent state
-        (jc_mamba_snapshot_tokens)."""
+        (jc_mamba_snapshot_tokens). Under --jc-pin-budget exclusive the nodes
+        in ``free`` (default _jc_free_nodes: held by in-flight requests) do
+        not count: only what pins alone keep resident."""
         nodes = [
             pin.lock.node for rid, pin in self.pin_table.items() if rid not in exclude
         ]
         snapshots = len(set(nodes)) + (extra_node is not None)
         if extra_node is not None:
             nodes.append(extra_node)
+        if free is None:
+            free = self._jc_free_nodes()
+        spans = self.tree_cache.union_path_spans(nodes)
         return (
-            self.tree_cache.union_path_tokens(nodes)
+            sum(span for node_id, span in spans.items() if node_id not in free)
             + self.jc_mamba_snapshot_tokens * snapshots
+        )
+
+    def _jc_inflight_holders(self) -> List[Req]:
+        """Requests that hold their own tree lock: running (and the batch in
+        flight), the chunked request and paused ones."""
+        reqs = set(self.collect_inflight_reqs())
+        reqs.update(self.paused_reqs.values())
+        if self.chunked_req is not None:
+            reqs.add(self.chunked_req)
+        return [
+            req
+            for req in reqs
+            if not req.finished()
+            and req.kv.holds_kv
+            and req.last_node is not None
+            and not is_virtual_node(req.last_node)
+        ]
+
+    def _jc_free_nodes(self, holders: Optional[List[Req]] = None) -> AbstractSet[Any]:
+        """--jc-pin-budget exclusive: the tree nodes on the paths in-flight
+        requests lock themselves, which the pin cap does not count (they stay
+        resident without the pins). Empty under --jc-pin-budget distinct."""
+        if self.jc_pin_budget != "exclusive":
+            return frozenset()
+        if holders is None:
+            holders = self._jc_inflight_holders()
+        return frozenset(
+            self.tree_cache.union_path_spans([req.last_node for req in holders])
+        )
+
+    def _jc_valve_order(self, rids: Sequence[str]) -> List[str]:
+        """Degradation order of the pressure valve: --jc-pin-overflow
+        next-use, the pin expected to be used latest first; otherwise the
+        least recently pinned or renewed first."""
+        if self.jc_pin_overflow == "next-use":
+            key = lambda r: (-self.pin_table[r].next_use(), self.pin_table[r].pinned_at)
+        else:
+            key = lambda r: self.pin_table[r].pinned_at
+        return sorted(rids, key=key)
+
+    def _jc_enforce_pin_cap(self) -> None:
+        """--jc-pin-budget exclusive, once per scheduling step: when the set of
+        in-flight requests changed (one finished, so the pins on its path now
+        keep that path alone), degrade pins in valve order until the cap
+        holds again. Truncate holds are never degraded."""
+        if (
+            self.jc_pin_budget != "exclusive"
+            or self.jc_pin_max_ratio <= 0
+            or not self.pin_table
+        ):
+            return
+        holders = self._jc_inflight_holders()
+        seen = frozenset(req.rid for req in holders)
+        if seen == self._jc_inflight_seen:
+            return
+        self._jc_inflight_seen = seen
+        free = self._jc_free_nodes(holders)
+        limit = int(self.jc_pin_max_ratio * self.max_total_num_tokens)
+        held = self._jc_pinned_tokens_total(free=free)
+        if held <= limit:
+            return
+        candidates = self._jc_valve_order(
+            [rid for rid, pin in self.pin_table.items() if pin.successor_of is None]
+        )
+
+        def fits(degraded: AbstractSet[str]) -> bool:
+            return self._jc_pinned_tokens_total(exclude=degraded, free=free) <= limit
+
+        victims = select_pins_to_degrade(candidates=candidates, fits=fits)
+        if victims is None:
+            victims = list(candidates)
+        for victim in victims:
+            self._jc_degrade_pin(victim)
+        logger.info(
+            f"joint-checkpoint: pin cap re-checked after the in-flight requests "
+            f"changed: {held} exclusive pinned tokens > limit {limit}; "
+            f"degraded={victims}"
         )
 
     def _jc_pinned_tokens_sum(self) -> int:
@@ -7791,6 +8015,7 @@ class Scheduler(
         resume, which is skipped under speculative decoding other than
         NGRAM."""
         self._jc_expire_pins()
+        self._jc_enforce_pin_cap()
         if self.jc_hybrid and self.jc_mamba_captures:
             self._jc_resolve_mamba_captures()
         return self._jc_pause_resume(running_batch)

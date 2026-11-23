@@ -119,12 +119,31 @@ class Memory(msgspec.Struct):
                 "would be exceeded. 'lru' degrades other pins, least recently "
                 "pinned or renewed first, until it fits (a degraded pin loses "
                 "its lock; its KV stays in the tree, evictable), and refuses "
-                "only if it cannot fit even then; 'refuse' refuses the new pin. "
+                "only if it cannot fit even then; 'next-use' degrades the pins "
+                "expected to be used latest first (a pin's /pin_request "
+                "resume_in_s hint, else its expiry), and only pins expected "
+                "later than the new hold, which otherwise gets a partial hold "
+                "or is refused; 'refuse' refuses the new pin. "
                 "Only used with --enable-joint-checkpoint."
             ),
-            choices=["lru", "refuse"],
+            choices=["lru", "next-use", "refuse"],
         ),
     ] = "lru"
+    jc_pin_budget: A[
+        str,
+        Arg(
+            help=(
+                "Joint checkpoint: what --jc-pin-max-ratio counts. 'distinct': "
+                "the distinct tree tokens the holds keep; 'exclusive': only those "
+                "of them no in-flight request (running, chunked or paused) holds "
+                "itself, i.e. the tokens kept resident by pins alone. Under "
+                "'exclusive' the cap is also re-checked whenever the set of "
+                "in-flight requests changes, degrading pins until it fits. Only "
+                "used with --enable-joint-checkpoint."
+            ),
+            choices=["distinct", "exclusive"],
+        ),
+    ] = "distinct"
     jc_admit_first_max_tokens: A[
         int,
         "Joint checkpoint: the successors of truncated requests get a prefill step of their own (no other waiting request and no chunked-prefill chunk in it) while their appended tokens total at most this many; a larger successor only goes to the head of the waiting queue. <= 0 disables the exclusive step. Only used with --enable-joint-checkpoint.",

@@ -4010,6 +4010,53 @@ class UnifiedRadixCache(BasePrefixCache):
         (path,) = self.tree_core.collect_path_info([node])
         return [(info.node_id, info.path_start, info.path_end) for info in path]
 
+    def jc_release_exclusive_tail(self, node: NodeId) -> Tuple[int, Optional[str]]:
+        """Joint checkpoint release: free now the tail of the root-to-``node``
+        path that nothing else holds or continues, instead of leaving it to
+        eviction. Walking up from ``node``, a node is freed while it holds no
+        lock (no running request, pin or truncate hold on it or below it) and
+        no other branch continues it: ``node`` itself must be a leaf, and each
+        ancestor must have had only the child freed just before it. Returns
+        (tokens freed, why nothing could be done or None).
+
+        Lock state is probed, not tracked: a lock on ``node`` moves exactly
+        the unlocked suffix of its path from evictable to protected (lock_ref
+        only grows towards the root), and its delta is that suffix's length;
+        the probe lock is dropped right away. Only on FULL-only trees without
+        a host tier, so every node freed is a device leaf evict_device_leaf
+        accepts (it asserts otherwise)."""
+        if self.disable:
+            return 0, "radix cache disabled"
+        if tuple(self.tree_components) != (ComponentType.FULL,):
+            return 0, "release needs a FULL-attention-only radix tree"
+        if self.cache_controller is not None:
+            return 0, "release is not supported with a host cache tier (HiCache)"
+        (path,) = self.tree_core.collect_path_info([node])
+        path = [info for info in path if not self.tree_core.is_root(info.node_id)]
+        if not path:
+            return 0, None
+        probe = self.inc_lock_ref(node)
+        self.dec_lock_ref(node, probe.to_dec_params())
+        unlocked = probe.delta or 0
+        victims = []
+        covered = 0
+        for depth, info in enumerate(reversed(path)):
+            if info.full_value_len is None:
+                break
+            if info.num_children != (0 if depth == 0 else 1):
+                break
+            covered += info.full_value_len
+            if covered > unlocked:
+                break
+            victims.append(info)
+        freed = 0
+        tracker = {ct: 0 for ct in self.tree_components}
+        for info in victims:
+            backup = self._evict_device_leaf(info.node_id, tracker)
+            assert backup is None, "a tree without a host tier handed back a backup"
+            freed += info.path_end - info.path_start
+        return freed, None
+
     def mamba_state_nodes(self, node: NodeId) -> List[Tuple[NodeId, int]]:
         """(node, end) of the nodes on the root-to-``node`` path that hold a
         device mamba state, in path order; end is the state's token offset."""
