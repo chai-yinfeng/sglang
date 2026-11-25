@@ -2572,6 +2572,11 @@ class PinReqOutput(BaseReq, kw_only=True):
     degraded: List[str] = []
     pins_degraded_total: int = 0
     pins_repinned_total: int = 0
+    # Pins degraded, and truncate holds dropped, since the server started
+    # because running or waiting requests needed the KV (memory pressure;
+    # not counted in pins_degraded_total).
+    pins_mem_degraded_total: int = 0
+    holds_mem_dropped_total: int = 0
     # True when this call re-pinned a pin the pressure valve had degraded.
     repinned: bool = False
     # Hybrid (mamba) models: the position of the recurrent state the hold

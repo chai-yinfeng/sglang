@@ -30,6 +30,7 @@ from typing import (
     TYPE_CHECKING,
     AbstractSet,
     Any,
+    Callable,
     Deque,
     Dict,
     List,
@@ -485,6 +486,9 @@ class JcPin:
     key: Optional[RadixKey] = None
     # time.monotonic() when the pressure valve dropped its lock.
     degraded_at: Optional[float] = None
+    # Degraded by the memory-pressure valve (_jc_relieve_memory_pressure:
+    # running or waiting requests needed the KV), not by the pin cap.
+    degraded_by_memory: bool = False
     # time.monotonic() when the client expects to use the held KV again
     # (/pin_request resume_in_s); None: expires_at stands in for it
     # (--jc-pin-overflow next-use).
@@ -555,6 +559,10 @@ class Scheduler(
     jc_pin_budget: str = "distinct"
     _jc_inflight_seen: AbstractSet[str] = frozenset()
     jc_released_tokens_total: int = 0
+    # Memory-pressure valve (_jc_relieve_memory_pressure): client pins
+    # degraded and truncate holds dropped since start.
+    jc_pins_mem_degraded_total: int = 0
+    jc_holds_mem_dropped_total: int = 0
 
     def __init__(
         self,
@@ -627,6 +635,10 @@ class Scheduler(
         self.jc_degraded_pins: Dict[str, JcPin] = {}
         self.jc_pins_degraded_total = 0
         self.jc_pins_repinned_total = 0
+        # Memory-pressure valve: pins degraded and truncate holds dropped
+        # because requests needed the KV (_jc_relieve_memory_pressure).
+        self.jc_pins_mem_degraded_total = 0
+        self.jc_holds_mem_dropped_total = 0
         # Joint checkpoint P5: rid -> request taken out of the decode batch by
         # pause_request or its lookahead budget. Not in waiting_queue or
         # running_batch; keeps its KV, tree lock and req_to_token row.
@@ -825,6 +837,7 @@ class Scheduler(
         self.init_mamba_truncation_align()
         self.check_truncation_align_fits_chunk()
         self.maybe_init_jc_hybrid()
+        self.init_jc_memory_pressure_valve()
 
         self.init_weight_updater()
 
@@ -1947,6 +1960,13 @@ class Scheduler(
         self.req_to_token_pool.jc_mamba_history = setup.history
         self.jc_mamba_snapshot_tokens = setup.snapshot_tokens
         self.jc_hybrid = True
+
+    def init_jc_memory_pressure_valve(self):
+        """Joint checkpoint: before a KV allocation fails for lack of free
+        or evictable tokens (evict_from_tree_cache), degrade pins and truncate
+        holds until it fits (_jc_relieve_memory_pressure)."""
+        if self.enable_joint_checkpoint:
+            self.tree_cache.jc_memory_pressure_hook = self._jc_on_alloc_shortfall
 
     def check_truncation_align_fits_chunk(self):
         """A chunk shorter than the alignment truncates to zero tokens, so a prompt
@@ -4468,6 +4488,14 @@ class Scheduler(
                     has_chunked_req=(self.chunked_req is not None),
                     truncation_align_size=self.truncation_align_size,
                 )
+                if (
+                    res == AddReqResult.NO_TOKEN
+                    and self.enable_joint_checkpoint
+                    and self.pin_table
+                    and not (adder.can_run_list and adder.can_run_list[-1] is req)
+                ):
+                    # Pins give way to a request that has arrived.
+                    res = self._jc_admit_under_memory_pressure(adder, req)
 
             if self.enable_lora:
                 running_loras.add(req.lora_id)
@@ -4676,6 +4704,12 @@ class Scheduler(
             # this step; decode the rest next step instead of retracting them.
             batch.batch_is_full = False
             return None
+        if kv_full_retract_flag and self.enable_joint_checkpoint:
+            # Degrade pins and truncate holds before retracting (or aborting)
+            # a decoding request.
+            kv_full_retract_flag = not self._jc_relieve_memory_pressure(
+                batch.check_decode_mem, "decode"
+            )
 
         # Check if decode out of memory
         if kv_full_retract_flag or (
@@ -6976,6 +7010,8 @@ class Scheduler(
                 pinned_tokens_total=self._jc_pinned_tokens_total(),
                 pinned_tokens_sum=self._jc_pinned_tokens_sum(),
                 pins_degraded_total=self.jc_pins_degraded_total,
+                pins_mem_degraded_total=self.jc_pins_mem_degraded_total,
+                holds_mem_dropped_total=self.jc_holds_mem_dropped_total,
                 pins_repinned_total=self.jc_pins_repinned_total,
             )
         if fit is not None and fit < req.kv.cache_protected_len:
@@ -7005,6 +7041,8 @@ class Scheduler(
                 message="tree did not hand out a lock",
                 degraded=degraded,
                 pins_degraded_total=self.jc_pins_degraded_total,
+                pins_mem_degraded_total=self.jc_pins_mem_degraded_total,
+                holds_mem_dropped_total=self.jc_holds_mem_dropped_total,
                 pins_repinned_total=self.jc_pins_repinned_total,
             )
         out = self._jc_pin_output(pinned_len=pinned_len, ttl_s=ttl_s, degraded=degraded)
@@ -7093,6 +7131,8 @@ class Scheduler(
                     f"was evicted; nothing to re-pin"
                 ),
                 pins_degraded_total=self.jc_pins_degraded_total,
+                pins_mem_degraded_total=self.jc_pins_mem_degraded_total,
+                holds_mem_dropped_total=self.jc_holds_mem_dropped_total,
                 pins_repinned_total=self.jc_pins_repinned_total,
             )
         refusal, degraded, fit = self._jc_make_room(
@@ -7122,6 +7162,8 @@ class Scheduler(
                 pinned_tokens_total=self._jc_pinned_tokens_total(),
                 pinned_tokens_sum=self._jc_pinned_tokens_sum(),
                 pins_degraded_total=self.jc_pins_degraded_total,
+                pins_mem_degraded_total=self.jc_pins_mem_degraded_total,
+                holds_mem_dropped_total=self.jc_holds_mem_dropped_total,
                 pins_repinned_total=self.jc_pins_repinned_total,
             )
         self.jc_pins_repinned_total += 1
@@ -7147,6 +7189,8 @@ class Scheduler(
             pinned_tokens_sum=self._jc_pinned_tokens_sum(),
             degraded=list(degraded),
             pins_degraded_total=self.jc_pins_degraded_total,
+            pins_mem_degraded_total=self.jc_pins_mem_degraded_total,
+            holds_mem_dropped_total=self.jc_holds_mem_dropped_total,
             pins_repinned_total=self.jc_pins_repinned_total,
             jc_state_at=pinned_len if self.jc_hybrid else None,
             mamba_history_slots=self._jc_mamba_history_slots(),
@@ -7365,6 +7409,136 @@ class Scheduler(
             f"last touched {now - pin.pinned_at:.1f}s ago, under pin pressure"
         )
 
+    def _jc_relieve_memory_pressure(
+        self,
+        fits: Callable[[], bool],
+        why: str,
+        *,
+        keep: Optional[str] = None,
+        tentative: bool = False,
+    ) -> bool:
+        """Joint checkpoint memory-pressure valve: drop the locks of pins,
+        then of truncate holds, one at a time until ``fits()`` (the caller's
+        own capacity check, which has just failed) holds. Pins go in pressure
+        valve order (_jc_valve_order: --jc-pin-overflow next-use, the one
+        expected to be used latest first; otherwise the least recently
+        touched first); truncate holds come last, their successor being
+        queued for admission now. ``keep``: a rid left alone. ``tentative``:
+        when ``fits()`` still fails with every candidate dropped, lock them
+        all again and change nothing. Returns whether ``fits()`` holds.
+
+        A degraded pin is recorded like one the pin cap degrades
+        (jc_degraded_pins: a renewal re-pins, a truncate cuts at what of its
+        path is left in the tree), marked degraded_by_memory and counted in
+        jc_pins_mem_degraded_total. A dropped truncate hold leaves its
+        successor to reuse the prefix eviction leaves and recompute the rest
+        (jc_holds_mem_dropped_total).
+
+        Callers: an allocation about to fail (_jc_on_alloc_shortfall), a
+        decode step about to retract (update_running_batch), a waiting request
+        refused for lack of tokens (_jc_admit_under_memory_pressure). A
+        request that has arrived needs the KV now; a pin only expects its
+        session back. Only a failed capacity check gets here, so a run whose
+        requests always fit degrades nothing. This was backlog #29, turned
+        down while the pin cap was thought to keep pins out of the requests'
+        way; it does not: --jc-pin-budget exclusive leaves out what in-flight
+        requests hold, so pins plus in-flight KV can fill the pool, and pins,
+        pin-on-finish holds and truncate holds lock KV after admission
+        counted it as evictable (a truncate of a degraded pin re-locks its
+        surviving path). Runs hit a scheduler OOM in a prefill allocation and
+        a decode request aborted by retract_decode."""
+        candidates = [rid for rid in self.pin_table if rid != keep]
+        if not candidates:
+            return False
+        holds = [r for r in candidates if self.pin_table[r].successor_of is not None]
+        pins = [r for r in candidates if self.pin_table[r].successor_of is None]
+        dropped: List[Tuple[str, JcPin]] = []
+        ok = False
+        for rid in self._jc_valve_order(pins) + self._jc_valve_order(holds):
+            pin = self.pin_table.pop(rid)
+            self.tree_cache.unlock(pin.lock)
+            dropped.append((rid, pin))
+            if fits():
+                ok = True
+                break
+        if not ok and tentative:
+            # The only tentative caller's fits() evicts nothing (see
+            # _jc_admit_under_memory_pressure): the nodes are still there.
+            for rid, pin in reversed(dropped):
+                pin.lock = self.tree_cache.lock(pin.lock.node)
+                self.pin_table[rid] = pin
+            return False
+        now = time.monotonic()
+        for rid, pin in dropped:
+            if pin.successor_of is not None:
+                self.jc_holds_mem_dropped_total += 1
+                logger.info(
+                    f"joint-checkpoint: dropped truncate hold for successor "
+                    f"rid={rid} (cut from {pin.successor_of}, len={pin.pinned_len}) "
+                    f"under memory pressure ({why})"
+                )
+                continue
+            pin.degraded_at = now
+            pin.degraded_by_memory = True
+            self.jc_degraded_pins[rid] = pin
+            self.jc_pins_mem_degraded_total += 1
+            logger.info(
+                f"joint-checkpoint: degraded pin rid={rid} len={pin.pinned_len} "
+                f"last touched {now - pin.pinned_at:.1f}s ago, under memory "
+                f"pressure ({why})"
+            )
+        if not ok:
+            logger.warning(
+                f"joint-checkpoint: memory pressure ({why}) not relieved with "
+                f"every pin and truncate hold degraded"
+            )
+        return ok
+
+    def _jc_on_alloc_shortfall(self, num_tokens: int) -> bool:
+        """tree_cache.jc_memory_pressure_hook (init_jc_memory_pressure_valve):
+        evict_from_tree_cache could not make ``num_tokens`` KV slots
+        available; degrade pins and truncate holds, evicting what each frees,
+        until it can. Returns whether the slots are available now."""
+        allocator = self.tree_cache.token_to_kv_pool_allocator
+
+        def fits() -> bool:
+            allocator.evict_to_free_tokens(self.tree_cache, num_tokens)
+            return allocator.available_size() >= num_tokens
+
+        return self._jc_relieve_memory_pressure(
+            fits, f"allocating {num_tokens} KV slots"
+        )
+
+    def _jc_admit_under_memory_pressure(
+        self, adder: PrefillAdder, req: Req
+    ) -> AddReqResult:
+        """``req`` was refused for lack of tokens (NO_TOKEN, not admitted):
+        degrade pins and truncate holds, its own hold excepted, until the
+        adder admits it, or, if it cannot fit even with all of them degraded,
+        leave every one as it was. Returns the adder's last verdict.
+
+        Not for a request with a host hit to load back: that admission path
+        can evict device KV before refusing, so the dropped locks could not
+        be taken again safely. It waits as before (an allocation is still
+        never refused for pins: _jc_on_alloc_shortfall)."""
+        res = AddReqResult.NO_TOKEN
+        if req.needs_host_load_back():
+            return res
+
+        def admitted() -> bool:
+            nonlocal res
+            res = adder.add_one_req(
+                req,
+                has_chunked_req=(self.chunked_req is not None),
+                truncation_align_size=self.truncation_align_size,
+            )
+            return bool(adder.can_run_list) and adder.can_run_list[-1] is req
+
+        self._jc_relieve_memory_pressure(
+            admitted, f"admitting rid={req.rid}", keep=req.rid, tentative=True
+        )
+        return res
+
     def _jc_take_hold(
         self,
         *,
@@ -7569,6 +7743,8 @@ class Scheduler(
             pinned_tokens_total=self._jc_pinned_tokens_total(),
             pinned_tokens_sum=self._jc_pinned_tokens_sum(),
             pins_degraded_total=self.jc_pins_degraded_total,
+            pins_mem_degraded_total=self.jc_pins_mem_degraded_total,
+            holds_mem_dropped_total=self.jc_holds_mem_dropped_total,
             pins_repinned_total=self.jc_pins_repinned_total,
             jc_state_at=held if pin is not None else None,
             jc_capture_at=target,
@@ -7621,6 +7797,8 @@ class Scheduler(
                 pinned_tokens_total=self._jc_pinned_tokens_total(),
                 pinned_tokens_sum=self._jc_pinned_tokens_sum(),
                 pins_degraded_total=self.jc_pins_degraded_total,
+                pins_mem_degraded_total=self.jc_pins_mem_degraded_total,
+                holds_mem_dropped_total=self.jc_holds_mem_dropped_total,
                 pins_repinned_total=self.jc_pins_repinned_total,
                 mamba_history_slots=self._jc_mamba_history_slots(),
             )
@@ -7832,7 +8010,9 @@ class Scheduler(
                     success=True,
                     message=(
                         f"request {recv_req.rid} was not pinned "
-                        f"(degraded under pin pressure)"
+                        f"(degraded under "
+                        f"{'memory' if degraded.degraded_by_memory else 'pin'} "
+                        f"pressure)"
                     ),
                 )
                 if release:

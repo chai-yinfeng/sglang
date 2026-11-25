@@ -284,9 +284,18 @@ def evict_from_tree_cache(
     tree_cache: BasePrefixCache | None, num_tokens: int
 ) -> bool | None:
     if tree_cache is not None and tree_cache.supports_prefix_sharing():
-        return tree_cache.token_to_kv_pool_allocator.evict_to_free_tokens(
-            tree_cache, num_tokens
-        )
+        allocator = tree_cache.token_to_kv_pool_allocator
+        result = allocator.evict_to_free_tokens(tree_cache, num_tokens)
+        # Joint checkpoint: pins and truncate holds lock KV eviction cannot
+        # take; before this allocation fails, the scheduler degrades them and
+        # evicts what that frees (Scheduler.init_jc_memory_pressure_valve).
+        # Read from the instance only: unset (and on stand-in caches) it is
+        # absent.
+        hook = getattr(tree_cache, "__dict__", {}).get("jc_memory_pressure_hook")
+        if hook is not None and allocator.available_size() < num_tokens:
+            if hook(num_tokens):
+                result = True
+        return result
 
 
 def _evict_until_allocatable(
