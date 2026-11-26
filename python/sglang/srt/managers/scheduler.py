@@ -7285,7 +7285,17 @@ class Scheduler(
         used later than the new hold (``next_use``, time.monotonic(); None:
         later than every pin), latest first (JcPin.next_use); a new hold
         expected to be used after all of them degrades nothing and gets the
-        partial hold or refusal that leaves."""
+        partial hold or refusal that leaves.
+
+        --jc-pin-budget exclusive: the cap is first re-checked for the
+        in-flight requests as they are now (_jc_enforce_pin_cap, a no-op when
+        they have not changed since the last check), so a request that has
+        just finished (its path now kept by the pins alone) makes the other
+        pins give way in valve order in this step, not in the next one after
+        this hold is taken. A hold is never taken beside other holds that
+        exceed the cap by themselves (then only truncate holds, which no valve
+        degrades): it is refused, even where it would add no token."""
+        self._jc_enforce_pin_cap()
         free = self._jc_free_nodes()
         refusal = self._jc_pin_cap_refusal(
             rid=rid, node=node, extra_tokens=extra_tokens, free=free
@@ -7316,6 +7326,16 @@ class Scheduler(
         victims = select_pins_to_degrade(candidates=candidates, fits=fits)
         fit = None
         if victims is None:
+            others = self._jc_pinned_tokens_total(
+                exclude=frozenset(candidates) | {rid}, free=free
+            )
+            if others > limit:
+                return (
+                    f"{refusal}; the other holds alone keep {others} > limit "
+                    f"{limit}",
+                    [],
+                    None,
+                )
             fit = self._jc_page_floor(
                 self._jc_longest_fit(
                     rid=rid,
@@ -8229,7 +8249,8 @@ class Scheduler(
         return sorted(rids, key=key)
 
     def _jc_enforce_pin_cap(self) -> None:
-        """--jc-pin-budget exclusive, once per scheduling step: when the set of
+        """--jc-pin-budget exclusive, once per scheduling step and before every
+        new hold is judged (_jc_make_room): when the set of
         in-flight requests changed (one finished, so the pins on its path now
         keep that path alone), degrade pins in valve order until the cap
         holds again. Truncate holds are never degraded."""

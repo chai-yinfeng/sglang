@@ -41,6 +41,7 @@ register_cpu_ci(est_time=10, suite="base-a-test-cpu")
 
 PROMPT, OUTPUT, FILL = T.PROMPT, T.OUTPUT, T.FILL
 SESSION = len(FILL)
+SESSION_8000 = T.PREFIX_LEN + T.TAIL_LEN  # a shared-prefix session's hold
 
 
 def intake_recv(rid, old_rid, pos, ttl_s):
@@ -260,6 +261,104 @@ class TestJointCheckpointFinishPinLockable(T._PinOnFinishFixture):
         s._jc_hold_on_finish(old)
         self.assertEqual(old.jc_pin_outcome["jc_pinned_len"], 0)
         self.assertNotIn("jc_pin_lockable_len", old.jc_pin_outcome)
+
+
+class TestJointCheckpointRebalanceOnFinish(T._SharedPrefixFixture):
+    """--jc-pin-budget exclusive, --jc-pin-overflow next-use, limit 9000: a
+    running request r1 keeps the shared prefix (4300) resident, so r0's and
+    r2's pins are charged their tails (3700 each) only. When r1 finishes, the
+    pins alone keep 11700: the cap is restored in valve order as r1's finish
+    hold is judged, not by the next step's re-check."""
+
+    def make_scheduler(self, *args, **kw):
+        s = super().make_scheduler(*args, max_ratio=9000 / 32768, **kw)
+        s.jc_pin_budget = "exclusive"
+        return s
+
+    def drop_finished(self, s):
+        s.running_batch.reqs = [r for r in s.running_batch.reqs if not r.finished()]
+
+    def test_the_cap_holds_when_a_shared_prefix_is_charged_again(self):
+        s = self.make_scheduler(overflow="next-use")
+        limit = int(s.jc_pin_max_ratio * s.max_total_num_tokens)
+        self.now = 1000.0
+        r0 = self.armed(s, "r0", prompt=T.session_prompt(0), outputs=[7], ttl_s=100.0)
+        self.finish(r0)  # expires 1100
+        self.drop_finished(s)
+        # r1 runs on the shared prefix; its finish hold is used last (expiry 4000).
+        r1 = self.armed(s, "r1", prompt=T.session_prompt(1), outputs=[7], ttl_s=3000.0)
+        self.assertEqual(r1.prefix_len, T.PREFIX_LEN)
+        self.now = 1001.0
+        r2 = self.armed(s, "r2", prompt=T.session_prompt(2), outputs=[7], ttl_s=100.0)
+        self.finish(r2)  # expires 1101
+        self.drop_finished(s)
+        s._jc_enforce_pin_cap()
+        self.assertEqual(s._jc_pinned_tokens_total(), 2 * T.TAIL_LEN)
+        self.assertEqual(s.jc_pins_degraded_total, 0)
+        self.now = 1002.0
+        self.finish(r1)
+        self.drop_finished(s)
+        # In this step: r2 (expected to be used latest of r0, r2) gave way,
+        # then r1's hold took what fits beside r0.
+        self.assertLessEqual(s._jc_pinned_tokens_total(), limit)
+        self.assertEqual(set(s.pin_table), {"r0", "r1"})
+        self.assertIn("r2", s.jc_degraded_pins)
+        self.assertEqual(s.jc_pins_degraded_total, 1)
+        # r0 keeps 8000; r1 adds its tail up to the 1000 left
+        self.assertEqual(r1.jc_pin_outcome["jc_pinned_len"], T.PREFIX_LEN + limit - SESSION_8000)
+        self.assertEqual(r1.jc_pin_outcome["jc_pin_lockable_len"], SESSION_8000)
+        # The next step's re-check finds nothing to do.
+        s._jc_enforce_pin_cap()
+        self.assertEqual(s.jc_pins_degraded_total, 1)
+        self.assertEqual(set(s.pin_table), {"r0", "r1"})
+
+    def test_unchanged_in_flight_set_degrades_nothing_more(self):
+        s = self.make_scheduler(overflow="next-use")
+        self.now = 1000.0
+        r0 = self.armed(s, "r0", prompt=T.session_prompt(0), outputs=[7], ttl_s=100.0)
+        self.finish(r0)
+        self.drop_finished(s)
+        self.now = 1001.0
+        r2 = self.armed(s, "r2", prompt=T.session_prompt(2), outputs=[7], ttl_s=100.0)
+        self.finish(r2)  # 8000 + 3700 > 9000: a partial hold, nothing degraded
+        self.assertEqual(s.jc_pins_degraded_total, 0)
+        self.assertEqual(set(s.pin_table), {"r0", "r2"})
+        self.assertLessEqual(
+            s._jc_pinned_tokens_total(), int(s.jc_pin_max_ratio * s.max_total_num_tokens)
+        )
+
+
+class TestJointCheckpointNoHoldBesideAnOverCapSet(T._SharedPrefixFixture):
+    """A hold is not taken beside holds that exceed the cap by themselves
+    (here truncate holds, which no valve degrades), even one that would add
+    no token to them."""
+
+    def test_refused_instead_of_a_free_riding_partial_hold(self):
+        s = self.make_scheduler(max_ratio=9000 / 32768, overflow="lru")
+        r0 = self.armed(s, "r0", prompt=T.session_prompt(0), outputs=[7])
+        self.finish(r0)
+        r2 = self.start("r2", T.session_prompt(2), [7])
+        self.finish(r2)
+        self.drop = [r for r in s.running_batch.reqs if not r.finished()]
+        s.running_batch.reqs = self.drop
+        for rid, req in (("h0", r0), ("h2", r2)):
+            s.pin_table[rid] = JcPin(
+                lock=self.cache.lock(req.last_node),
+                pinned_len=SESSION_8000,
+                pinned_at=900.0,
+                expires_at=1030.0,
+                successor_of="x",
+            )
+        self.assertGreater(
+            s._jc_pinned_tokens_total(exclude={"r0"}),
+            int(s.jc_pin_max_ratio * s.max_total_num_tokens),
+        )
+        r1 = self.armed(s, "r1", prompt=T.session_prompt(1), outputs=[7])
+        self.finish(r1)
+        self.assertEqual(r1.jc_pin_outcome["jc_pinned_len"], 0)
+        self.assertIn("the other holds alone keep", r1.jc_pin_outcome["jc_pin_message"])
+        self.assertEqual(set(s.pin_table), {"r0", "h0", "h2"})
+        self.assertEqual(s.jc_pins_degraded_total, 0)
 
 
 if __name__ == "__main__":
