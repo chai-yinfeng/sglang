@@ -7462,6 +7462,7 @@ class Scheduler(
         *,
         keep: Optional[str] = None,
         tentative: bool = False,
+        may_evict: bool = False,
     ) -> bool:
         """Joint checkpoint memory-pressure valve: drop the locks of pins,
         then of truncate holds, one at a time until ``fits()`` (the caller's
@@ -7471,7 +7472,10 @@ class Scheduler(
         touched first); truncate holds come last, their successor being
         queued for admission now. ``keep``: a rid left alone. ``tentative``:
         when ``fits()`` still fails with every candidate dropped, lock them
-        all again and change nothing. Returns whether ``fits()`` holds.
+        all again and change nothing (``may_evict``: fits() may have evicted
+        some of them, so only those whose path is still on the device are
+        locked again; the rest are degraded). Returns whether ``fits()``
+        holds.
 
         Once it holds, a dropped hold that made no room is taken again
         (_jc_restore_idle_drops): one whose path a running request or another
@@ -7515,20 +7519,29 @@ class Scheduler(
             if fits():
                 ok = True
                 break
-        if not ok and tentative:
-            # The only tentative caller's fits() evicts nothing (see
-            # _jc_admit_under_memory_pressure): the nodes are still there.
+        if not ok and tentative and not may_evict:
+            # fits() evicted nothing: the nodes are still there.
             for rid, pin, _ in reversed(dropped):
                 pin.lock = self.tree_cache.lock(pin.lock.node)
                 self.pin_table[rid] = pin
             return False
-        restored = self._jc_restore_idle_drops(dropped) if ok else set()
+        if ok:
+            restored = self._jc_restore_idle_drops(dropped)
+        elif tentative:
+            restored = self._jc_relock_surviving(dropped)
+        else:
+            restored = set()
         now = time.monotonic()
         for rid, pin, _ in dropped:
             if rid in restored:
                 logger.info(
                     f"joint-checkpoint: kept rid={rid} len={pin.pinned_len} under "
-                    f"memory pressure ({why}): dropping its lock freed nothing"
+                    f"memory pressure ({why}): "
+                    + (
+                        "dropping its lock freed nothing"
+                        if ok
+                        else "it did not help, locked again"
+                    )
                 )
                 continue
             if pin.successor_of is not None:
@@ -7552,6 +7565,7 @@ class Scheduler(
             logger.warning(
                 f"joint-checkpoint: memory pressure ({why}) not relieved with "
                 f"every pin and truncate hold degraded"
+                + (f"; locked again: {sorted(restored)}" if tentative else "")
             )
         return ok
 
@@ -7587,6 +7601,29 @@ class Scheduler(
             restored.add(rid)
         return restored
 
+    def _jc_relock_surviving(
+        self, dropped: Sequence[Tuple[str, JcPin, int]]
+    ) -> AbstractSet[str]:
+        """A tentative memory-pressure valve whose fits() may have evicted
+        device KV (a host load-back admission) and still failed: lock again
+        each hold in ``dropped`` whose recorded path is still all on the
+        device (matched again: the node it held may have been split or
+        evicted). Returns the rids taken again."""
+        restored = set()
+        for rid, pin, _ in reversed(dropped):
+            if pin.key is None:
+                continue
+            length, node = self._jc_prefix_node(pin.key, pin.pinned_len)
+            if length < pin.pinned_len:
+                continue
+            lock = self.tree_cache.lock(node)
+            if lock is None:
+                continue
+            pin.lock = lock
+            self.pin_table[rid] = pin
+            restored.add(rid)
+        return restored
+
     def _jc_on_alloc_shortfall(self, num_tokens: int) -> bool:
         """tree_cache.jc_memory_pressure_hook (init_jc_memory_pressure_valve):
         evict_from_tree_cache could not make ``num_tokens`` KV slots
@@ -7610,13 +7647,15 @@ class Scheduler(
         adder admits it, or, if it cannot fit even with all of them degraded,
         leave every one as it was. Returns the adder's last verdict.
 
-        Not for a request with a host hit to load back: that admission path
-        can evict device KV before refusing, so the dropped locks could not
-        be taken again safely. It waits as before (an allocation is still
-        never refused for pins: _jc_on_alloc_shortfall)."""
+        A request with a host hit to load back (HiCache; a truncate
+        successor's prefix often is on the host) is judged the same way: the
+        adder budgets the load-back's device tokens with its own extend. Its
+        admission can evict device KV and still refuse (the load-back's own
+        eviction, PrefillAdder.add_one_req), so when it does not get in, a
+        dropped hold is taken again only where its recorded path is still all
+        on the device; one eviction took stays degraded
+        (_jc_relock_surviving)."""
         res = AddReqResult.NO_TOKEN
-        if req.needs_host_load_back():
-            return res
 
         def admitted() -> bool:
             nonlocal res
@@ -7628,7 +7667,11 @@ class Scheduler(
             return bool(adder.can_run_list) and adder.can_run_list[-1] is req
 
         self._jc_relieve_memory_pressure(
-            admitted, f"admitting rid={req.rid}", keep=req.rid, tentative=True
+            admitted,
+            f"admitting rid={req.rid}",
+            keep=req.rid,
+            tentative=True,
+            may_evict=req.needs_host_load_back(),
         )
         return res
 

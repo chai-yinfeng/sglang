@@ -35,6 +35,7 @@ from sglang.srt.managers.io_struct import (  # noqa: E402
 )
 from sglang.srt.managers.scheduler import JcPin  # noqa: E402
 from sglang.srt.mem_cache.allocation import alloc_token_slots  # noqa: E402
+from sglang.srt.mem_cache.base_prefix_cache import EvictParams  # noqa: E402
 from sglang.test.ci.ci_register import register_cpu_ci  # noqa: E402
 
 register_cpu_ci(est_time=10, suite="base-a-test-cpu")
@@ -359,6 +360,92 @@ class TestJointCheckpointNoHoldBesideAnOverCapSet(T._SharedPrefixFixture):
         self.assertIn("the other holds alone keep", r1.jc_pin_outcome["jc_pin_message"])
         self.assertEqual(set(s.pin_table), {"r0", "h0", "h2"})
         self.assertEqual(s.jc_pins_degraded_total, 0)
+
+
+class _LoadBackAdder(M._LiveAdder):
+    """PrefillAdder.add_one_req on a request with a host hit to load back, as
+    far as the valve can tell: admission is judged on ``need`` (the
+    load-back's device tokens plus the extend) against free and evictable
+    tokens; once admitted, the load-back takes ``load`` device slots, evicting
+    for them (UnifiedRadixCache._load_back_transfers). On the calls in
+    ``evict_and_refuse`` the load-back evicts what it can and still fails, as
+    a load-back that cannot get its slots does before admission refuses."""
+
+    def __init__(self, cache, need, load, evict_and_refuse=()):
+        super().__init__(cache, need)
+        self.load = load
+        self.evict_and_refuse = set(evict_and_refuse)
+
+    def add_one_req(self, req, has_chunked_req, truncation_align_size):
+        self.calls += 1
+        allocator = self.cache.token_to_kv_pool_allocator
+        if self.calls in self.evict_and_refuse:
+            self.cache.evict(EvictParams(num_tokens=self.need))
+            return M.AddReqResult.NO_TOKEN
+        if allocator.available_size() + self.cache.evictable_size() < self.need:
+            return M.AddReqResult.NO_TOKEN
+        short = self.load - allocator.available_size()
+        if short > 0:
+            self.cache.evict(EvictParams(num_tokens=short))
+        self.loaded = allocator.alloc(self.load)
+        self.can_run_list.append(req)
+        return M.AddReqResult.NO_TOKEN
+
+
+class TestJointCheckpointHostLoadBackAdmission(M._MemPressureFixture):
+    """A waiting request whose prefix is partly on the host (HiCache) and
+    refused for lack of tokens: pins and truncate holds give way to it too,
+    its own hold excepted; when it still does not get in, the holds are
+    locked again where their path is still on the device."""
+
+    def locked_full(self):
+        s = self.make_scheduler(overflow="lru")
+        s.truncation_align_size = None
+        succ = self.held(s, 2, 999.0)
+        self.pinned(s, "a", 0, 1000.0)
+        self.pinned(s, "b", 1, 1001.0)
+        self.running(s, "r", M.disjoint(3), 64 - 2 * SESSION - 13 - 10)
+        self.assert_full()
+        return s, succ
+
+    def test_a_successor_with_a_host_hit_is_admitted_keeping_its_hold(self):
+        s, succ = self.locked_full()
+        succ.host_hit_length = 4
+        self.assertTrue(succ.needs_host_load_back())
+        adder = _LoadBackAdder(self.cache, need=20, load=4)
+        s._jc_admit_under_memory_pressure(adder, succ)
+        self.assertEqual(adder.can_run_list, [succ])
+        self.assertEqual(len(adder.loaded), 4)
+        self.assert_mem_degraded(s, ["a", "b"])
+        self.assertEqual(set(s.pin_table), {"succ"})  # its own hold
+        self.assertEqual(s.jc_holds_mem_dropped_total, 0)
+
+    def test_a_refused_load_back_relocks_only_what_eviction_left(self):
+        s, _ = self.locked_full()
+        req = T.make_req("w", M.disjoint(4))
+        req.host_hit_length = 4
+        # The first attempt (a dropped) evicts a's path and still fails; the
+        # request needs more than dropping everything frees.
+        adder = _LoadBackAdder(self.cache, need=60, load=4, evict_and_refuse={1})
+        res = s._jc_admit_under_memory_pressure(adder, req)
+        self.assertEqual(res, M.AddReqResult.NO_TOKEN)
+        self.assertEqual(adder.can_run_list, [])
+        self.assertEqual(adder.calls, 3)
+        self.assertEqual(set(s.pin_table), {"b", "succ"})
+        self.assertTrue(s.jc_degraded_pins["a"].degraded_by_memory)
+        self.assertEqual(s.jc_pins_mem_degraded_total, 1)
+        self.assertEqual(s.jc_holds_mem_dropped_total, 0)
+        # b and the truncate hold really hold their paths again.
+        self.evict_all()
+        self.assertEqual(self.match_len(M.disjoint(1) + OUTPUT), SESSION)
+        self.assertEqual(self.match_len(M.disjoint(2) + OUTPUT), 13)
+        self.assertEqual(self.match_len(M.disjoint(0) + OUTPUT), 0)
+
+
+class TestJointCheckpointHostLoadBackAdmissionPythonCore(
+    TestJointCheckpointHostLoadBackAdmission
+):
+    tree_core_backend = "python"
 
 
 if __name__ == "__main__":

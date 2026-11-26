@@ -336,15 +336,15 @@ class TestJointCheckpointMemPressureAdmission(_MemPressureFixture):
         alloc_token_slots(self.cache, 10)
         self.assert_mem_degraded(s, ["a"])
 
-    def test_request_with_a_host_hit_waits_as_before(self):
+    def test_request_with_a_host_hit_goes_through_the_valve_too(self):
         s, _ = self.locked_full()
         req = T.make_req("w", disjoint(4))
-        req.host_hit_length = 4  # admission may evict while loading it back
+        req.host_hit_length = 4  # its load-back is budgeted by the adder
         adder = _LiveAdder(self.cache, need=20)
-        res = s._jc_admit_under_memory_pressure(adder, req)
-        self.assertEqual(res, AddReqResult.NO_TOKEN)
-        self.assertEqual(adder.calls, 0)
-        self.assertEqual(set(s.pin_table), {"a", "b", "succ"})
+        s._jc_admit_under_memory_pressure(adder, req)
+        self.assertEqual(adder.can_run_list, [req])
+        self.assert_mem_degraded(s, ["a", "b"])
+        self.assertEqual(set(s.pin_table), {"succ"})
 
 
 if __name__ == "__main__":
