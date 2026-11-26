@@ -213,6 +213,7 @@ class _TruncateFixture(CustomTestCase):
         s.jc_pin_max_ratio = max_ratio
         s.jc_pin_overflow = overflow
         s.jc_degraded_pins = {}
+        s.jc_expired_pins = {}
         s.jc_pins_degraded_total = 0
         s.jc_pins_repinned_total = 0
         s.max_total_num_tokens = self.pool_size
@@ -1261,6 +1262,7 @@ class TestJointCheckpointPinPressureValve(_PinOnFinishFixture):
                 "jc_pin_message": "pin cap exceeded: 48 distinct pinned tokens "
                 "with this hold on c (32 without it) > limit 40 "
                 "(--jc-pin-max-ratio 0.16 x 256)",
+                "jc_pin_lockable_len": 16,
             },
         )
         self.assertEqual(set(s.pin_table), {"a", "b"})
@@ -1380,6 +1382,7 @@ class TestJointCheckpointPartialHold(_PinOnFinishFixture):
             {
                 "jc_pinned_len": 12,
                 "jc_pin_message": "partial hold: 12 of 16 tokens fit under --jc-pin-max-ratio",
+                "jc_pin_lockable_len": 16,
             },
         )
         # The hold ends at 12 exactly: the rest is evictable.

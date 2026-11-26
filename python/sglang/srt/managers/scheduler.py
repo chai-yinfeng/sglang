@@ -481,8 +481,9 @@ class JcPin:
     # Truncate hold: the rid of the request that was cut. Released once the
     # keyed request is admitted (it then holds the prefix itself) or aborted.
     successor_of: Optional[str] = None
-    # Client pin / pin-on-finish hold: its token path [0, pinned_len) and
-    # namespace, so a degraded pin can be matched again after eviction.
+    # Its token path [0, pinned_len) and namespace, so a degraded pin can be
+    # matched again after eviction (a truncate hold's too, for the
+    # memory-pressure valve to lock it again: _jc_restore_idle_drops).
     key: Optional[RadixKey] = None
     # time.monotonic() when the pressure valve dropped its lock.
     degraded_at: Optional[float] = None
@@ -549,6 +550,10 @@ class Scheduler(
     # until the continuing request is admitted (a backstop; admission or an
     # abort of that request normally releases it within a step).
     JC_TRUNCATE_HOLD_TTL_S: float = 30.0
+    # Joint checkpoint: at most this many expired pins are remembered for a
+    # later release (jc_expired_pins), oldest forgotten first; each for at most
+    # --jc-pin-max-ttl-s after it expired.
+    JC_EXPIRED_PINS_MAX: int = 1024
     # Joint checkpoint on a hybrid (mamba) model, set by maybe_init_jc_hybrid:
     # every hold then ends on a node holding the recurrent state at its end,
     # and one such state weighs jc_mamba_snapshot_tokens in the pin cap.
@@ -633,6 +638,9 @@ class Scheduler(
         # Pin pressure valve: rid -> pin whose lock was dropped to make room for
         # a newer pin; a renewal re-pins what of its path is still in the tree.
         self.jc_degraded_pins: Dict[str, JcPin] = {}
+        # rid -> pin whose TTL ran out, kept (lock gone) so a later
+        # /unpin_request release can still free its dead path (_jc_expire_pins).
+        self.jc_expired_pins: Dict[str, JcPin] = {}
         self.jc_pins_degraded_total = 0
         self.jc_pins_repinned_total = 0
         # Memory-pressure valve: pins degraded and truncate holds dropped
@@ -3493,19 +3501,10 @@ class Scheduler(
                 self._add_request_to_queue(req)
                 return
 
-        if recv_req.truncate is not None:
-            # Joint checkpoint P3, after every other check on this request:
-            # once it passes, the request it continues is cut for good.
-            error_msg = self._jc_truncate(req, recv_req)
+        if recv_req.truncate is not None or recv_req.jc_pin_on_finish is not None:
+            # Joint checkpoint, after every other check on this request.
+            error_msg = self._jc_intake(req, recv_req)
             if error_msg is not None:
-                req.set_finish_with_abort(error_msg)
-                self._add_request_to_queue(req)
-                return
-
-        if recv_req.jc_pin_on_finish is not None:
-            error_msg = self._jc_arm_pin_on_finish(req, recv_req)
-            if error_msg is not None:
-                req.jc_pin_outcome = {"jc_pinned_len": 0, "jc_pin_message": error_msg}
                 req.set_finish_with_abort(error_msg)
                 self._add_request_to_queue(req)
                 return
@@ -5764,6 +5763,7 @@ class Scheduler(
                 # Pinned nodes do not survive the reset; drop their locks with them.
                 self.pin_table.clear()
                 self.jc_degraded_pins.clear()
+                self.jc_expired_pins.clear()
                 if self.jc_hybrid:
                     self.jc_mamba_captures.clear()
             self.tree_cache.reset()
@@ -6438,6 +6438,31 @@ class Scheduler(
                 return req
         return None
 
+    def _jc_intake(
+        self, req: Req, recv_req: TokenizedGenerateReqInput
+    ) -> Optional[str]:
+        """Joint checkpoint fields of a /generate at request intake, after
+        every other check on ``req``: jc_pin_on_finish is validated first,
+        then truncate (P3) runs, then the pin-on-finish is armed. A truncate
+        that passes cuts the request it continues for good (and may hold its
+        prefix), so every check that can still refuse ``req`` comes before it.
+        Returns an error message (``req`` is then rejected and nothing has
+        changed), or None."""
+        on_finish = getattr(recv_req, "jc_pin_on_finish", None)
+        if on_finish is not None:
+            error_msg = self._jc_pin_on_finish_refusal(req, recv_req)
+            if error_msg is not None:
+                req.jc_pin_outcome = {"jc_pinned_len": 0, "jc_pin_message": error_msg}
+                return error_msg
+        if getattr(recv_req, "truncate", None) is not None:
+            error_msg = self._jc_truncate(req, recv_req)
+            if error_msg is not None:
+                return error_msg
+        if on_finish is not None:
+            # Validated above: arming only sets fields on req.
+            self._jc_arm_pin_on_finish(req, recv_req)
+        return None
+
     def _jc_truncate(
         self, req: Req, recv_req: TokenizedGenerateReqInput
     ) -> Optional[str]:
@@ -6782,6 +6807,7 @@ class Scheduler(
             pinned_at=now,
             expires_at=now + self.JC_TRUNCATE_HOLD_TTL_S,
             successor_of=cut_rid,
+            key=key,
         )
         if prev is not None:
             self.tree_cache.unlock(prev.lock)
@@ -7427,6 +7453,11 @@ class Scheduler(
         when ``fits()`` still fails with every candidate dropped, lock them
         all again and change nothing. Returns whether ``fits()`` holds.
 
+        Once it holds, a dropped hold that made no room is taken again
+        (_jc_restore_idle_drops): one whose path a running request or another
+        hold still keeps frees nothing when unlocked, so degrading it would
+        only cost the client its hold.
+
         A degraded pin is recorded like one the pin cap degrades
         (jc_degraded_pins: a renewal re-pins, a truncate cuts at what of its
         path is left in the tree), marked degraded_by_memory and counted in
@@ -7452,24 +7483,34 @@ class Scheduler(
             return False
         holds = [r for r in candidates if self.pin_table[r].successor_of is not None]
         pins = [r for r in candidates if self.pin_table[r].successor_of is None]
-        dropped: List[Tuple[str, JcPin]] = []
+        # (rid, pin, tokens its drop made evictable)
+        dropped: List[Tuple[str, JcPin, int]] = []
         ok = False
         for rid in self._jc_valve_order(pins) + self._jc_valve_order(holds):
             pin = self.pin_table.pop(rid)
+            before = self.tree_cache.evictable_size()
             self.tree_cache.unlock(pin.lock)
-            dropped.append((rid, pin))
+            gained = self.tree_cache.evictable_size() - before
+            dropped.append((rid, pin, gained))
             if fits():
                 ok = True
                 break
         if not ok and tentative:
             # The only tentative caller's fits() evicts nothing (see
             # _jc_admit_under_memory_pressure): the nodes are still there.
-            for rid, pin in reversed(dropped):
+            for rid, pin, _ in reversed(dropped):
                 pin.lock = self.tree_cache.lock(pin.lock.node)
                 self.pin_table[rid] = pin
             return False
+        restored = self._jc_restore_idle_drops(dropped) if ok else set()
         now = time.monotonic()
-        for rid, pin in dropped:
+        for rid, pin, _ in dropped:
+            if rid in restored:
+                logger.info(
+                    f"joint-checkpoint: kept rid={rid} len={pin.pinned_len} under "
+                    f"memory pressure ({why}): dropping its lock freed nothing"
+                )
+                continue
             if pin.successor_of is not None:
                 self.jc_holds_mem_dropped_total += 1
                 logger.info(
@@ -7493,6 +7534,38 @@ class Scheduler(
                 f"every pin and truncate hold degraded"
             )
         return ok
+
+    def _jc_restore_idle_drops(
+        self, dropped: Sequence[Tuple[str, JcPin, int]]
+    ) -> AbstractSet[str]:
+        """Once the memory-pressure valve's fits() holds: lock again the holds
+        in ``dropped`` (rid, pin, tokens its drop made evictable) that made no
+        room. A hold whose drop made nothing evictable is taken again when
+        its path is still all in the tree and locking it again moves nothing
+        out of the evictable set (probed: the lock's evictable delta), so the
+        room fits() found is untouched. One that shared its path with a hold
+        dropped after it, whose drop then freed that path, is not (the probe
+        sees the delta, or eviction took the path). Matched by its recorded
+        path (the node it held may have been split or evicted). Returns the
+        rids taken again."""
+        restored = set()
+        for rid, pin, gained in reversed(dropped):
+            if gained > 0 or pin.key is None:
+                continue
+            length, node = self._jc_prefix_node(pin.key, pin.pinned_len)
+            if length < pin.pinned_len:
+                continue
+            before = self.tree_cache.evictable_size()
+            lock = self.tree_cache.lock(node)
+            if lock is None:
+                continue
+            if self.tree_cache.evictable_size() != before:
+                self.tree_cache.unlock(lock)
+                continue
+            pin.lock = lock
+            self.pin_table[rid] = pin
+            restored.add(rid)
+        return restored
 
     def _jc_on_alloc_shortfall(self, num_tokens: int) -> bool:
         """tree_cache.jc_memory_pressure_hook (init_jc_memory_pressure_valve):
@@ -7560,6 +7633,7 @@ class Scheduler(
         now = time.monotonic()
         old_pin = self.pin_table.pop(rid, None)
         self.jc_degraded_pins.pop(rid, None)
+        self.jc_expired_pins.pop(rid, None)
         self.pin_table[rid] = JcPin(
             lock=new_lock,
             pinned_len=pinned_len,
@@ -7587,13 +7661,35 @@ class Scheduler(
         """Joint checkpoint pin-on-finish at request intake: arm the hold that
         release_kv_cache takes (_jc_hold_on_finish) when ``req`` finishes with
         its KV written to the tree. Returns an error message for a request
-        that cannot be pinned. Without --enable-joint-checkpoint the request
-        runs unchanged and reports jc_pinned_len 0."""
+        that cannot be pinned (_jc_pin_on_finish_refusal, which
+        handle_generate_request checks first, before a truncate cuts
+        anything). Without --enable-joint-checkpoint the request runs
+        unchanged and reports jc_pinned_len 0."""
         if not self.enable_joint_checkpoint:
             req.jc_pin_outcome = {
                 "jc_pinned_len": 0,
                 "jc_pin_message": "--enable-joint-checkpoint is not set",
             }
+            return None
+        if (refusal := self._jc_pin_on_finish_refusal(req, recv_req)) is not None:
+            return refusal
+        req.jc_pin_ttl_s = recv_req.jc_pin_on_finish.ttl_s
+        req.jc_finish_hold = self._jc_hold_on_finish
+        # Replaced by _jc_hold_on_finish; stays when the request finishes
+        # without a tree insert (discard, truncate cut, chunked-prefill abort).
+        req.jc_pin_outcome = {
+            "jc_pinned_len": 0,
+            "jc_pin_message": "request finished without writing its KV to the radix tree",
+        }
+        return None
+
+    def _jc_pin_on_finish_refusal(
+        self, req: Req, recv_req: TokenizedGenerateReqInput
+    ) -> Optional[str]:
+        """Why ``req``'s jc_pin_on_finish cannot be armed, or None. No side
+        effects. None without --enable-joint-checkpoint (arming then only
+        reports jc_pinned_len 0)."""
+        if not self.enable_joint_checkpoint:
             return None
         if recv_req.session_params is not None:
             return "jc_pin_on_finish cannot be combined with session_params"
@@ -7607,14 +7703,6 @@ class Scheduler(
         ttl_s = recv_req.jc_pin_on_finish.ttl_s
         if ttl_s is not None and (refusal := self._jc_ttl_refusal(ttl_s)) is not None:
             return f"jc_pin_on_finish: {refusal}"
-        req.jc_pin_ttl_s = ttl_s
-        req.jc_finish_hold = self._jc_hold_on_finish
-        # Replaced by _jc_hold_on_finish; stays when the request finishes
-        # without a tree insert (discard, truncate cut, chunked-prefill abort).
-        req.jc_pin_outcome = {
-            "jc_pinned_len": 0,
-            "jc_pin_message": "request finished without writing its KV to the radix tree",
-        }
         return None
 
     def _jc_hold_on_finish(self, req: Req) -> None:
@@ -7662,6 +7750,11 @@ class Scheduler(
             req.jc_pin_outcome = {"jc_pinned_len": pinned_len}
         if self.jc_hybrid and refusal is None:
             req.jc_pin_outcome["jc_state_at"] = pinned_len
+        if req.jc_pin_outcome["jc_pinned_len"] < want:
+            # What the hold would have covered without the cap or a refusal:
+            # the most of this path any hold can lock (the last token has no
+            # KV). Absent: jc_pinned_len is all of it.
+            req.jc_pin_outcome["jc_pin_lockable_len"] = want
         if degraded:
             req.jc_pin_outcome["jc_pin_degraded"] = degraded
         if refusal is not None:
@@ -8018,6 +8111,17 @@ class Scheduler(
                 if release:
                     self._jc_release_path(recv_req.rid, degraded, out)
                 return out
+            expired = self.jc_expired_pins.pop(recv_req.rid, None)
+            if expired is not None:
+                # Its TTL ran out before the client unpinned: the lock is gone,
+                # the dead path may still be freed.
+                out = UnpinReqOutput(
+                    success=True,
+                    message=f"request {recv_req.rid} was not pinned (expired)",
+                )
+                if release:
+                    self._jc_release_path(recv_req.rid, expired, out)
+                return out
             return UnpinReqOutput(
                 success=True, message=f"request {recv_req.rid} was not pinned"
             )
@@ -8169,7 +8273,12 @@ class Scheduler(
 
     def _jc_expire_pins(self) -> None:
         """Release the /pin_request holds whose TTL has passed, and forget pins
-        degraded longer ago than any lease could have lasted."""
+        degraded, or expired, longer ago than any lease could have lasted.
+
+        An expired client pin or pin-on-finish hold is remembered
+        (jc_expired_pins, lock gone, at most JC_EXPIRED_PINS_MAX) so that the
+        client's /unpin_request release, which may come after the TTL, still
+        frees the tail of its path nothing else holds."""
         now = time.monotonic()
         if self.jc_degraded_pins:
             self.jc_degraded_pins = {
@@ -8177,16 +8286,26 @@ class Scheduler(
                 for rid, pin in self.jc_degraded_pins.items()
                 if now - pin.degraded_at < self.jc_pin_max_ttl_s
             }
+        if self.jc_expired_pins:
+            self.jc_expired_pins = {
+                rid: pin
+                for rid, pin in self.jc_expired_pins.items()
+                if now - pin.expires_at < self.jc_pin_max_ttl_s
+            }
         if not self.pin_table:
             return
         expired = [rid for rid, pin in self.pin_table.items() if now >= pin.expires_at]
         for rid in expired:
             pin = self.pin_table.pop(rid)
             self.tree_cache.unlock(pin.lock)
+            if pin.successor_of is None and pin.key is not None:
+                self.jc_expired_pins[rid] = pin
             logger.info(
                 f"joint-checkpoint: pin expired rid={rid} len={pin.pinned_len} "
                 f"after {now - pin.pinned_at:.1f}s"
             )
+        while len(self.jc_expired_pins) > self.JC_EXPIRED_PINS_MAX:
+            del self.jc_expired_pins[next(iter(self.jc_expired_pins))]
 
     def _jc_on_step(self, running_batch: ScheduleBatch) -> ScheduleBatch:
         """Joint checkpoint bookkeeping run once per scheduling step (from

@@ -160,6 +160,7 @@ class TestJointCheckpointPinTTL(CustomTestCase):
         s.jc_pin_max_ratio = max_ratio
         s.jc_pin_overflow = overflow
         s.jc_degraded_pins = {}
+        s.jc_expired_pins = {}
         s.jc_pins_degraded_total = 0
         s.jc_pins_repinned_total = 0
         s.max_total_num_tokens = POOL_SIZE
@@ -332,7 +333,7 @@ class TestJointCheckpointPinTTL(CustomTestCase):
         s.tree_cache = MagicMock(wraps=self.cache)
         out = s.unpin_request(UnpinReqInput(rid="a"))
         self.assertTrue(out.success)
-        self.assertEqual(out.message, "request a was not pinned")
+        self.assertEqual(out.message, "request a was not pinned (expired)")
         s.tree_cache.unlock.assert_not_called()
 
     # ------------------------------------------------------------ cap
